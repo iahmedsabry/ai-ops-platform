@@ -1,0 +1,39 @@
+- name: Bootstrap GitOps
+  hosts: localhost
+
+  vars:
+    kubeconfig_path: "{{ lookup('env','HOME') }}/.kube/config"
+    argocd_namespace: argocd
+    root_app_url: https://raw.githubusercontent.com/iahmedsabry/ai-ops-platform-gitops/main/bootstrap/root-app.yaml
+
+  tasks:
+
+    - name: Add Argo Helm repo
+      command: helm repo add argo https://argoproj.github.io/argo-helm
+      register: helm_repo_add
+      failed_when: false
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Update Helm repos
+      command: helm repo update
+
+    - name: Install or upgrade Argo CD
+      command: >
+        helm upgrade --install argocd argo/argo-cd
+        --version 5.51.6
+        -n {{ argocd_namespace }}
+        --create-namespace
+        --wait
+
+    - name: Wait for Argo CD core components
+      shell: |
+        kubectl wait --for=condition=available deployment/argocd-server -n {{ argocd_namespace }} --timeout=300s
+        kubectl wait --for=condition=available deployment/argocd-repo-server -n {{ argocd_namespace }} --timeout=300s
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-application-controller -n {{ argocd_namespace }} --timeout=300s
+        
+
+    - name: Apply root app
+      shell: |
+        kubectl apply -f {{ root_app_url }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
