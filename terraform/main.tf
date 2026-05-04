@@ -1,3 +1,5 @@
+data "aws_availability_zones" "available" {}
+
 # Create VPC using variable instead of hardcoding
 resource "aws_vpc" "main" {
   cidr_block = var.vpc_cidr  # Use value from terraform.tfvars
@@ -17,7 +19,8 @@ resource "aws_subnet" "public" {
 
   vpc_id     = aws_vpc.main.id                 # Attach to our VPC
   cidr_block = var.public_subnets[count.index] # Get each CIDR from list
-
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  
   map_public_ip_on_launch = true  # Instances get public IPs
 
   tags = {
@@ -31,6 +34,7 @@ resource "aws_subnet" "private" {
 
   vpc_id     = aws_vpc.main.id                  # Attach to VPC
   cidr_block = var.private_subnets[count.index] # Loop through private subnets
+  availability_zone = data.aws_availability_zones.available.names[count.index]
 
   map_public_ip_on_launch = false  # No public IPs (important!)
 
