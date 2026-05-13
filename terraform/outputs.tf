@@ -15,3 +15,7 @@ output "private_subnet_ids" {
   description = "IDs of private subnets"
   value       = aws_subnet.private[*].id  # Get all private subnet IDs
 }
+
+output "alb_controller_role_arn" {
+  value = aws_iam_role.alb_controller.arn
+}
