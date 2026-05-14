@@ -17,9 +17,11 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
 import base64
+import re
 import requests
 import os
 import json
+from pathlib import Path
 
 app = FastAPI()
 
@@ -57,6 +59,81 @@ _ALLOWED_IMAGE_MIME = frozenset(
 
 
 # =========================================================
+# Prompt modes (per-focus instructions from prompt_modes/*.txt)
+# =========================================================
+_PROMPT_STEM_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _load_prompt_mode_files():
+
+    base = Path(__file__).resolve().parent / "prompt_modes"
+    out = {}
+
+    if not base.is_dir():
+
+        return out
+
+    for path in sorted(base.glob("*.txt")):
+
+        stem = path.stem.lower()
+
+        if not _PROMPT_STEM_PATTERN.match(stem):
+
+            continue
+
+        try:
+
+            text = path.read_text(encoding="utf-8").strip()
+
+        except OSError:
+
+            continue
+
+        if not text:
+
+            continue
+
+        out[stem] = text
+
+    return out
+
+
+PROMPT_MODE_FILES = _load_prompt_mode_files()
+
+ALLOWED_PROMPT_MODES = frozenset(
+    set(PROMPT_MODE_FILES.keys()) | {"general"}
+)
+
+
+def normalize_prompt_mode(
+    mode: Optional[str],
+) -> str:
+
+    if mode is None:
+
+        return "general"
+
+    cleaned = str(mode).strip().lower()
+
+    if cleaned in ALLOWED_PROMPT_MODES:
+
+        return cleaned
+
+    return "general"
+
+
+def focus_instruction_block(
+    mode: str,
+) -> str:
+
+    if mode == "general":
+
+        return ""
+
+    return PROMPT_MODE_FILES.get(mode, "")
+
+
+# =========================================================
 # Request model
 # =========================================================
 class ChatImagePart(BaseModel):
@@ -69,6 +146,7 @@ class ChatImagePart(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     images: Optional[List[ChatImagePart]] = None
+    prompt_mode: Optional[str] = None
 
 
 # =========================================================
@@ -610,6 +688,7 @@ def chat_metadata():
         "supports_images": True,
         "max_chat_images": MAX_CHAT_IMAGES,
         "max_image_bytes": MAX_IMAGE_BYTES,
+        "prompt_modes": sorted(ALLOWED_PROMPT_MODES),
     }
 
 
@@ -624,6 +703,32 @@ def chat(request: ChatRequest):
 
         user_msg_stripped = (
             (request.message or "").strip()
+        )
+
+        effective_mode = normalize_prompt_mode(
+            request.prompt_mode,
+        )
+
+        focus_extra = focus_instruction_block(
+            effective_mode,
+        )
+
+        focus_section = ""
+
+        if focus_extra.strip():
+
+            focus_section = f"""
+
+=========================================================
+USER SELECTED FOCUS (bias tool choice and analysis toward this)
+=========================================================
+
+{focus_extra.strip()}
+
+"""
+
+        prompt_focus_separator = (
+            focus_section if focus_section else "\n\n"
         )
 
         screenshot_primary_question = (
@@ -713,8 +818,7 @@ PLANNING RULES
    present above, IGNORE this excuse — screenshots override small-talk.
 9. When screenshots imply incidents, regressions, or misconfiguration tied to Kubernetes,
    cloud load balancers, or GitOps tooling, SCHEDULE LIVE TOOLS IMMEDIATELY even if USER REQUEST text says only "ideas" / "thoughts".
-
-=========================================================
+{prompt_focus_separator}=========================================================
 RESPONSE FORMAT (JSON ONLY)
 =========================================================
 
@@ -893,7 +997,7 @@ Rules:
 • No unnecessary preamble (“Certainly!”, “I'd be happy to…”).
 • Use ### for a heading and bullets (**-**) when listing steps is clearer.
 
-User message:
+{prompt_focus_separator}User message:
 {request.message}
 """
 
@@ -1955,7 +2059,7 @@ then the EXECUTIVE SUMMARY. When you write for the USER:
 • If metrics are missing or Prom queries failed, mention **only when** skipping it would confuse the diagnosis you are
   delivering **for this thread** — never as a standalone monitoring sermon.
 
-=========================================================
+{prompt_focus_separator}=========================================================
 USER REQUEST
 =========================================================
 

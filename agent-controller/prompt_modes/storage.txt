@@ -1,0 +1,1 @@
+Prioritize storage: **list_pvcs**, **list_pvs**, **list_storage_classes**, **list_events** for attach/mount/provision failures, and **get_pod_details** when PVC/volume claims appear on unhealthy pods. Correlate claims with live PVC/PV data.

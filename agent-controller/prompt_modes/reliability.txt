@@ -1,0 +1,1 @@
+Prioritize stability and incidents: **list_events**, workload status, **get_deployment_rollout_status** when rollouts are in scope, **get_pod_details** and **get_logs** (use **previous_container** after restarts) for unhealthy pods. Favor evidence of crash loops, probes, Pending, ImagePull, and ReplicaSet churn over generic cluster tours.

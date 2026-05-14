@@ -1,0 +1,1 @@
+Prioritize FinOps and capacity signals: include **finops_cluster_signals** with **prometheus_common_metrics**, plus **list_resource_quotas**, **list_pvcs**, **list_nodes**, and HPAs when relevant. Bias the plan toward requests/limits vs usage, node mix, storage footprints, and observable utilization signals—not generic advice without sandbox data.

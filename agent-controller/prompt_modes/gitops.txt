@@ -1,0 +1,1 @@
+Prioritize GitOps state: **list_argocd_applications** and related tools in the catalog; correlate with Deployments, Services, and **list_events** where sync or health issues appear. Ground conclusions in live application and workload data.

@@ -1,0 +1,1 @@
+The user may want to know what would need to change in Kubernetes or GitOps configs. Infer likely manifest or config deltas from sandbox data, but **never claim changes were applied**—sandbox is read-only. Be explicit that steps are proposals to validate in git/CI and apply via normal change control.
