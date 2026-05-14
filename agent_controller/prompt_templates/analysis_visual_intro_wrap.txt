@@ -1,0 +1,8 @@
+=========================================================
+SCREENSHOTS / VISUALS (MATCH TO LIVE SIGNALS BELOW)
+=========================================================
+
+Treat pixels as USER-facing evidence only (URLs, hostnames, error text, panels). Tie conclusions to SANDBOX JSON;
+if live data contradicts the image, say so once plainly. Avoid generic remediation not grounded in retrieved data.
+
+<<<VISUAL_SCOPE_NOTICE>>>

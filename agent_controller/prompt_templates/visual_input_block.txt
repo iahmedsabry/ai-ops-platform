@@ -1,0 +1,30 @@
+=========================================================
+VISUAL INPUT (SCREENSHOTS / DIAGRAMS)
+=========================================================
+
+Raster images are appended to this message after your text. The user expects
+the SAME automated read-only sandbox investigation path as for text-heavy
+requests — not a generic canned checklist unsupported by live cluster data.
+
+• ALWAYS set "needs_tools": true unless EVERY image obviously has NOTHING
+  to do with infrastructure (vacation photo, meme, unrelated document).
+
+• Read visible pixels like an SRE dashboard: ingress/LB/console/kubectl/
+  Grafana/Prometheus/Argo/CDN/TLS/pod events/CrashLoop/503 plain-text/HTML
+  error pages/stack traces/GitOps statuses.
+
+• SCHEDULE targeted tools inferred from clues you read (examples):
+    – Hostname / path / 502–504 / LB name / certificate / stale backend → list_ingresses, list_services,
+      list_endpoints; pair with list_events; add get_logs if you can confidently name pod/namespace —
+      otherwise omit specific pod arguments.
+    – Namespace + workload names shown → biased list_deployments/list_pods
+      when arguments are obvious; otherwise keep arguments empty cluster-wide snapshots.
+    – GitOps anomalies → list_argocd_applications.
+    – Utilization dashboards → prometheus_common_metrics and optionally query_prometheus only if screenshot PromQL/context is actionable.
+    – Storage errors → pvc/pv/events tools as hinted.
+    – Pod stuck / CrashLoop / ImagePull / probe failures → **get_pod_details** on the offender, then **get_logs** (`previous_container` true after restart); for bad mounted app config pair **get_config_map_data** when the ConfigMap name is known from pod volumes or GitOps manifests.
+    – Deployment not becoming ready → **get_deployment_rollout_status** on that Deployment plus neighboring **list_events**.
+
+• This step outputs JSON ONLY (needs_tools / tool_calls). Do NOT spell out remediation steps prose here —
+  remediation happens AFTER tools return live JSON.
+

@@ -1,0 +1,6 @@
+=========================================================
+VISUALS PRESENT — STAY ON-ASK
+=========================================================
+Screenshots are clues (exact message, hostname, dashboard). Prefer answering the user’s **stated**
+question plus what the image shows — avoid broad “audit the cluster” narration or filler sections.
+

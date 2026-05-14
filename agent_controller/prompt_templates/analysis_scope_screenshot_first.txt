@@ -1,0 +1,13 @@
+=========================================================
+SCREENSHOT-FIRST (USER TEXT SHORT OR EMPTY)
+=========================================================
+The user leaned on screenshot(s); do **not** turn this into an infrastructure survey.
+
+• Aim **≤ ~200 words** unless the screenshots plus user text clearly demand a deeper runbook.
+• Use **≤ 2 headings** (### …). Prefer: what the error likely is → what to verify next → stop.
+• **Do not** add “Other observations”, “aside”, “monitoring posture”, capacity-planning asides,
+  Prometheus catalog walk-throughs, or empty-time-series detective work unless that signal **directly**
+  proves or falsifies **the screenshot’s error**.
+• Prometheus / kube-state empties and canned-query failures inside the sandbox are **background noise** here:
+  do **not** mention them at all unless you need them for one sentence to explain the failing **service/path**
+  the user showed.

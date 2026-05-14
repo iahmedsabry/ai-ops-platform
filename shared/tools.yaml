@@ -1,0 +1,112 @@
+# Single source of truth: planner hints (controller) + allow-list names (sandbox).
+# Loaded at runtime by both services from COPY shared/ in each image.
+tools:
+  - name: list_pods
+    arguments: {}
+    detail: >-
+      Pods in all namespaces: status, restarts, per-container requests/limits, node, IPs.
+  - name: list_deployments
+    arguments: {}
+    detail: Replica health, strategy, availability per Deployment.
+  - name: list_stateful_sets
+    arguments: {}
+    detail: Stateful app footprint and replica readiness.
+  - name: list_daemon_sets
+    arguments: {}
+    detail: Node daemons/system agents coverage.
+  - name: list_cron_jobs
+    arguments: {}
+    detail: Scheduled batch work, suspend state, schedules.
+  - name: list_jobs
+    arguments:
+      limit: optional int, max 300; recent Jobs first.
+    detail: Recent batch Jobs and completion/failure counts.
+  - name: list_services
+    arguments: {}
+    detail: ClusterIP/LB/NodePort footprint and ports.
+  - name: list_endpoints
+    arguments: {}
+    detail: Whether Services actually have backing pods.
+  - name: list_ingresses
+    arguments: {}
+    detail: External hostnames and ingress exposure.
+  - name: list_namespaces
+    arguments: {}
+    detail: Namespace inventory and phase.
+  - name: list_nodes
+    arguments: {}
+    detail: Capacity/allocatable, instance type, kubelet version, Ready status.
+  - name: list_events
+    arguments:
+      namespace: optional; omit for cluster-wide Warnings.
+    detail: Recent Warning events (noise filtered).
+  - name: list_horizontal_pod_autoscalers
+    arguments: {}
+    detail: Autoscaling targets, min/max, current/desired.
+  - name: list_pvcs
+    arguments: {}
+    detail: Claim sizes, storage class, binding state.
+  - name: list_pvs
+    arguments: {}
+    detail: Cluster storage volumes and claims (cost context).
+  - name: list_storage_classes
+    arguments: {}
+    detail: Provisioners and reclaim/binding modes.
+  - name: list_resource_quotas
+    arguments: {}
+    detail: Namespace hard limits vs observed usage.
+  - name: list_limit_ranges
+    arguments: {}
+    detail: Default/min/max constraints for workloads.
+  - name: list_argocd_applications
+    arguments: {}
+    detail: GitOps health and sync status.
+  - name: get_logs
+    arguments:
+      namespace: default default
+      pod_name: optional explicit pod
+      app_label: optional app= selector
+      container_name: optional multi-container pods
+      tail_lines: default 200 (max 2500)
+      previous_container: boolean; set true right after restarts for the last crashed instance's log
+      timestamps: boolean prefix each line with k8s timestamps
+    detail: >-
+      Container logs — use when events/pods show crashes or errors, not only when user types 'logs'.
+  - name: get_pod_details
+    arguments:
+      namespace: default default
+      pod_name: required
+    detail: >-
+      Deep pod view: phase, conditions, per-container waiting/termination reasons, restarts, QoS, probes,
+      PVC volume claims, owners — use for CrashLoop, Pending, ImagePull failures, or before previous_container logs.
+  - name: get_deployment_rollout_status
+    arguments:
+      namespace: default default
+      deployment_name: required Deployment name
+    detail: >-
+      Rollout health: desired vs ready/available/updated, pause flag, strategy, Deployment status conditions
+      (Progressing/Available ReplicaFailure messages).
+  - name: get_config_map_data
+    arguments:
+      namespace: default default
+      config_map_name: required; alias key 'name' accepted
+      keys: optional list — only return these data keys
+      max_value_chars: optional 500–64000 per string value
+    detail: >-
+      Reads ConfigMap string data (budget-capped) — for bad config, wrong URLs, feature flags, Helm-created values.
+      Does not return Secret contents.
+  - name: query_prometheus
+    arguments:
+      query: required PromQL instant query
+    detail: Custom metrics — CPU, memory, SLIs, kube-state metrics.
+  - name: prometheus_common_metrics
+    arguments: {}
+    detail: >-
+      Runs a small curated bundle (scrape health, CPU/memory by namespace, failing pod phases). Use for cost/capacity
+      when exact PromQL is unknown.
+  - name: finops_cluster_signals
+    arguments: {}
+    detail: >-
+      Summarizes node SKU mix across zones plus optional cloud/node-pool hints (AWS EKS/GKE/AKS labels when present)
+      and Prometheus signals for requests vs allocations (PVC, CPU/memory requests, allocatables) — works wherever standard
+      kube-state-metrics + cAdvisor-compatible series exist.

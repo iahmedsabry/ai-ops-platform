@@ -1,0 +1,1 @@
+Prioritize networking: **list_services**, **list_endpoints**, **list_ingresses**, and **list_events** for Service/Ingress routing and empty-endpoint symptoms. Tie findings to namespaces and names from tool JSON.

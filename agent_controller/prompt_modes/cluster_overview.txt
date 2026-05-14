@@ -1,0 +1,1 @@
+The user wants a broad health and posture snapshot. Prefer a wide, complementary set of list/snapshot tools (workloads, networking endpoints, capacity/storage hints, GitOps if present, **prometheus_common_metrics**, **list_events**) so the answer summarizes the cluster without over-focusing on a single namespace unless specified.

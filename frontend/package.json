@@ -1,0 +1,11 @@
+{
+  "name": "kai-frontend",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/build-static.mjs"
+  },
+  "devDependencies": {
+    "vite": "^5.4.11"
+  }
+}
