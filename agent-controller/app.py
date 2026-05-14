@@ -15,6 +15,8 @@
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+from typing import List, Optional
+import base64
 import requests
 import os
 import json
@@ -38,12 +40,35 @@ MAX_TOOL_CONTEXT_CHARS = int(
     os.getenv("MAX_TOOL_CONTEXT_CHARS", "120000")
 )
 
+MAX_CHAT_IMAGES = int(os.getenv("MAX_CHAT_IMAGES", "6"))
+
+MAX_IMAGE_BYTES = int(
+    os.getenv("MAX_IMAGE_BYTES", str(4 * 1024 * 1024))
+)
+
+_ALLOWED_IMAGE_MIME = frozenset(
+    {
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+    }
+)
+
 
 # =========================================================
 # Request model
 # =========================================================
+class ChatImagePart(BaseModel):
+    """Single image as base64 (no data: URL prefix required)."""
+
+    mime_type: str
+    data: str
+
+
 class ChatRequest(BaseModel):
     message: str
+    images: Optional[List[ChatImagePart]] = None
 
 
 # =========================================================
@@ -55,11 +80,88 @@ def root():
 
 
 # =========================================================
+# Multipart images for Gemini
+# =========================================================
+def sanitize_chat_images(
+    images: Optional[List[ChatImagePart]],
+):
+
+    if not images:
+        return []
+
+    cleaned = []
+
+    for img in images[:MAX_CHAT_IMAGES]:
+
+        mime = (img.mime_type or "").strip().lower()
+
+        if mime == "image/jpg":
+            mime = "image/jpeg"
+
+        if mime not in _ALLOWED_IMAGE_MIME:
+            continue
+
+        raw = (img.data or "").strip()
+
+        if raw.startswith("data:") and ";base64," in raw:
+            raw = raw.split(";base64,", 1)[1]
+
+        raw = "".join(raw.split())
+
+        try:
+            blob = base64.b64decode(raw, validate=False)
+        except Exception:
+            continue
+
+        if len(blob) < 32 or len(blob) > MAX_IMAGE_BYTES:
+            continue
+
+        b64_out = base64.standard_b64encode(blob).decode("ascii")
+
+        cleaned.append(
+            {
+                "mime_type": mime,
+                "data": b64_out,
+            }
+        )
+
+    return cleaned
+
+
+def build_gemini_parts_from_inline(
+    prompt: str,
+    inline_items: List[dict],
+):
+
+    parts = [{"text": prompt}]
+
+    for item in inline_items:
+
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": item["mime_type"],
+                    "data": item["data"],
+                }
+            }
+        )
+
+    return parts
+
+
+# =========================================================
 # Gemini API call
 # =========================================================
-def call_gemini(prompt):
+def call_gemini(
+    prompt: str,
+    inline_images: Optional[List[dict]] = None,
+):
 
     import time
+
+    inlined = inline_images if inline_images is not None else []
+
+    parts = build_gemini_parts_from_inline(prompt, inlined)
 
     api_key = os.getenv("GEMINI_API_KEY")
 
@@ -82,9 +184,7 @@ def call_gemini(prompt):
                 json={
                     "contents": [
                         {
-                            "parts": [
-                                {"text": prompt}
-                            ]
+                            "parts": parts
                         }
                     ]
                 },
@@ -176,9 +276,17 @@ def extract_text(gemini_response):
         if not parts:
             return ""
 
-        text = parts[0].get("text", "")
+        chunks = []
 
-        return text.strip()
+        for part in parts:
+
+            fragment = part.get("text")
+
+            if fragment:
+
+                chunks.append(fragment)
+
+        return "\n".join(chunks).strip()
 
     except Exception as e:
 
@@ -324,11 +432,57 @@ TOOL_CATALOG = [
             "pod_name": "optional explicit pod",
             "app_label": "optional app= selector",
             "container_name": "optional multi-container pods",
-            "tail_lines": "default 200",
+            "tail_lines": "default 200 (max 2500)",
+            "previous_container": (
+                "boolean; set true right after restarts for the "
+                "last crashed instance's log"
+            ),
+            "timestamps": "boolean prefix each line with k8s timestamps",
         },
         "detail": (
             "Container logs — use when events/pods show crashes "
             "or errors, not only when user types 'logs'."
+        ),
+    },
+    {
+        "name": "get_pod_details",
+        "arguments": {
+            "namespace": "default default",
+            "pod_name": "required",
+        },
+        "detail": (
+            "Deep pod view: phase, conditions, per-container "
+            "waiting/termination reasons, restarts, QoS, probes, "
+            "PVC volume claims, owners — use for CrashLoop, Pending, "
+            "ImagePull failures, or before previous_container logs."
+        ),
+    },
+    {
+        "name": "get_deployment_rollout_status",
+        "arguments": {
+            "namespace": "default default",
+            "deployment_name": "required Deployment name",
+        },
+        "detail": (
+            "Rollout health: desired vs ready/available/updated, "
+            "pause flag, strategy, Deployment status conditions "
+            "(Progressing/Available ReplicaFailure messages)."
+        ),
+    },
+    {
+        "name": "get_config_map_data",
+        "arguments": {
+            "namespace": "default default",
+            "config_map_name": (
+                "required; alias key 'name' accepted"
+            ),
+            "keys": "optional list — only return these data keys",
+            "max_value_chars": "optional 500–64000 per string value",
+        },
+        "detail": (
+            "Reads ConfigMap string data (budget-capped) — for bad "
+            "config, wrong URLs, feature flags, Helm-created values. "
+            "Does not return Secret contents."
         ),
     },
     {
@@ -347,15 +501,49 @@ TOOL_CATALOG = [
             "when exact PromQL is unknown."
         ),
     },
+    {
+        "name": "finops_cluster_signals",
+        "arguments": {},
+        "detail": (
+            "Summarizes node SKU mix across zones plus optional "
+            "cloud/node-pool hints (AWS EKS/GKE/AKS labels when present) "
+            "and Prometheus signals for requests vs allocations (PVC, "
+            "CPU/memory requests, allocatables) — works wherever standard "
+            "kube-state-metrics + cAdvisor-compatible series exist."
+        ),
+    },
 ]
 
 
 AVAILABLE_TOOLS = [entry["name"] for entry in TOOL_CATALOG]
 
 
-# =========================================================
-# Context packing for final LLM synthesis
-# =========================================================
+def default_wide_tool_plan():
+
+    return [
+        {"tool": "list_pods", "arguments": {}},
+        {"tool": "list_deployments", "arguments": {}},
+        {"tool": "list_stateful_sets", "arguments": {}},
+        {"tool": "list_daemon_sets", "arguments": {}},
+        {"tool": "list_cron_jobs", "arguments": {}},
+        {"tool": "list_jobs", "arguments": {"limit": 120}},
+        {"tool": "list_services", "arguments": {}},
+        {"tool": "list_endpoints", "arguments": {}},
+        {"tool": "list_ingresses", "arguments": {}},
+        {"tool": "list_namespaces", "arguments": {}},
+        {"tool": "list_nodes", "arguments": {}},
+        {"tool": "list_events", "arguments": {}},
+        {"tool": "list_horizontal_pod_autoscalers", "arguments": {}},
+        {"tool": "list_pvcs", "arguments": {}},
+        {"tool": "list_pvs", "arguments": {}},
+        {"tool": "list_storage_classes", "arguments": {}},
+        {"tool": "list_resource_quotas", "arguments": {}},
+        {"tool": "list_limit_ranges", "arguments": {}},
+        {"tool": "list_argocd_applications", "arguments": {}},
+        {"tool": "finops_cluster_signals", "arguments": {}},
+        {"tool": "prometheus_common_metrics", "arguments": {}},
+    ]
+
 def truncate_context_block(text, max_chars):
 
     if len(text) <= max_chars:
@@ -419,6 +607,9 @@ def chat_metadata():
         "model": GEMINI_MODEL,
         "api_base_display": GEMINI_DISPLAY_API.strip(),
         "supports_post": True,
+        "supports_images": True,
+        "max_chat_images": MAX_CHAT_IMAGES,
+        "max_image_bytes": MAX_IMAGE_BYTES,
     }
 
 
@@ -428,11 +619,56 @@ def chat(request: ChatRequest):
 
     try:
 
-        # =================================================
-        # STEP 1: Ask Gemini if tools are needed
-        # =================================================
+        inline_visuals = sanitize_chat_images(request.images)
+        has_screenshots = len(inline_visuals) > 0
 
-        tool_prompt = f"""
+        user_msg_stripped = (
+            (request.message or "").strip()
+        )
+
+        screenshot_primary_question = (
+            has_screenshots
+            and len(user_msg_stripped) < 100
+        )
+
+        visual_planner_intro = ""
+
+        if has_screenshots:
+
+            visual_planner_intro = """
+=========================================================
+VISUAL INPUT (SCREENSHOTS / DIAGRAMS)
+=========================================================
+
+Raster images are appended to this message after your text. The user expects
+the SAME automated read-only sandbox investigation path as for text-heavy
+requests — not a generic canned checklist unsupported by live cluster data.
+
+• ALWAYS set \"needs_tools\": true unless EVERY image obviously has NOTHING
+  to do with infrastructure (vacation photo, meme, unrelated document).
+
+• Read visible pixels like an SRE dashboard: ingress/LB/console/kubectl/
+  Grafana/Prometheus/Argo/CDN/TLS/pod events/CrashLoop/503 plain-text/HTML
+  error pages/stack traces/GitOps statuses.
+
+• SCHEDULE targeted tools inferred from clues you read (examples):
+    – Hostname / path / 502–504 / LB name / certificate / stale backend → list_ingresses, list_services,
+      list_endpoints; pair with list_events; add get_logs if you can confidently name pod/namespace —
+      otherwise omit specific pod arguments.
+    – Namespace + workload names shown → biased list_deployments/list_pods
+      when arguments are obvious; otherwise keep arguments empty cluster-wide snapshots.
+    – GitOps anomalies → list_argocd_applications.
+    – Utilization dashboards → prometheus_common_metrics and optionally query_prometheus only if screenshot PromQL/context is actionable.
+    – Storage errors → pvc/pv/events tools as hinted.
+    – Pod stuck / CrashLoop / ImagePull / probe failures → **get_pod_details** on the offender, then **get_logs** (`previous_container` true after restart); for bad mounted app config pair **get_config_map_data** when the ConfigMap name is known from pod volumes or GitOps manifests.
+    – Deployment not becoming ready → **get_deployment_rollout_status** on that Deployment plus neighboring **list_events**.
+
+• This step outputs JSON ONLY (needs_tools / tool_calls). Do NOT spell out remediation steps prose here —
+  remediation happens AFTER tools return live JSON.
+
+"""
+
+        tool_prompt = f"""{visual_planner_intro}
 You are planning READ-ONLY Kubernetes investigation steps for an agent
 that runs tools in a locked-down sandbox. Pick tools so the downstream LLM
 receives enough real cluster data to answer code, application, cost,
@@ -457,13 +693,26 @@ PLANNING RULES
    tools (workloads + networking + capacity + storage signals + events).
 5. Include prometheus_common_metrics whenever cost, utilization, right-
    sizing, performance, or anomalies are relevant; add query_prometheus with
-   tailored PromQL when you know the exact metric/question.
-6. Include list_events when diagnosing instability; include get_logs when
-   pods/events point to crash loops or Failed phases (pass namespace/pod_name
-   when inferable, otherwise use app_label or namespace-only discovery).
+   tailored PromQL when you know the exact metric/question. For COST / FinOps /
+   spend / billing / savings / waste / SKU / utilization vs allocation ASKS,
+   always include **finops_cluster_signals** alongside prometheus_common_metrics
+   (and usually list_pvcs + list_resource_quotas + list_nodes + HPAs): it
+   gathers node mix & Prometheus request/PVC footprints even though kubectl
+   cannot see cloud-provider invoices themselves.
+6. Include list_events when diagnosing instability. For crash loops, probe
+   failures, Pending, or ImagePullBackOff: call **get_pod_details** (namespace+
+   pod_name) then **get_logs** — use `previous_container: true` on logs when the
+   pod restarted. For stalled rollouts call **get_deployment_rollout_status**.
+   When misconfiguration comes from mounted ConfigMaps and the name is known,
+   add **get_config_map_data**. Pass explicit namespace/pod/deployment whenever
+   events or list_* output provides them.
 7. It is acceptable to schedule many tools in parallel — prefer missing
    signals over saving API calls.
-8. Skip tools only when obviously unrelated (e.g. pure generic small-talk).
+8. Skip setting needs_tools ONLY for obvious non-infra chat with NO relevant
+   screenshots supplied (vacation snaps, greetings). If VISUAL INPUT block is
+   present above, IGNORE this excuse — screenshots override small-talk.
+9. When screenshots imply incidents, regressions, or misconfiguration tied to Kubernetes,
+   cloud load balancers, or GitOps tooling, SCHEDULE LIVE TOOLS IMMEDIATELY even if USER REQUEST text says only "ideas" / "thoughts".
 
 =========================================================
 RESPONSE FORMAT (JSON ONLY)
@@ -494,7 +743,10 @@ USER REQUEST
 {request.message}
 """
 
-        tool_decision = call_gemini(tool_prompt)
+        tool_decision = call_gemini(
+            tool_prompt,
+            inline_visuals,
+        )
 
         # Handle Gemini API errors
         if tool_decision.get("error"):
@@ -576,11 +828,24 @@ USER REQUEST
                 "limitrange",
                 "sandbox",
                 "workload",
+                "finops",
+                "budget",
+                "spend",
+                "savings",
+                "waste",
+                "crash",
+                "crashloop",
+                "rollout",
+                "configmap",
+                "troubleshoot",
+                "restart",
+                "imagepull",
+                "pending",
             ]
 
             message_lower = request.message.lower()
 
-            should_use_tools = any(
+            should_use_tools = has_screenshots or any(
                 keyword in message_lower
                 for keyword in kubernetes_keywords
             )
@@ -589,64 +854,7 @@ USER REQUEST
 
                 decision_json = {
                     "needs_tools": True,
-
-                    # Safe wide snapshot when Gemini's JSON planner output
-                    # is unparsable.
-                    "tool_calls": [
-                        {"tool": "list_pods", "arguments": {}},
-                        {"tool": "list_deployments", "arguments": {}},
-                        {
-                            "tool": "list_stateful_sets",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": "list_daemon_sets",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": "list_cron_jobs",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": "list_jobs",
-                            "arguments": {"limit": 120},
-                        },
-                        {"tool": "list_services", "arguments": {}},
-                        {"tool": "list_endpoints", "arguments": {}},
-                        {"tool": "list_ingresses", "arguments": {}},
-                        {"tool": "list_namespaces", "arguments": {}},
-                        {"tool": "list_nodes", "arguments": {}},
-                        {
-                            "tool": "list_events",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": ("list_horizontal_pod_autoscalers"),
-                            "arguments": {},
-                        },
-                        {"tool": "list_pvcs", "arguments": {}},
-                        {"tool": "list_pvs", "arguments": {}},
-                        {
-                            "tool": "list_storage_classes",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": "list_resource_quotas",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": "list_limit_ranges",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": "list_argocd_applications",
-                            "arguments": {},
-                        },
-                        {
-                            "tool": ("prometheus_common_metrics"),
-                            "arguments": {},
-                        },
-                    ],
+                    "tool_calls": default_wide_tool_plan(),
                 }
 
             else:
@@ -656,6 +864,20 @@ USER REQUEST
                 }
 
         needs_tools = decision_json.get("needs_tools", False)
+
+        if has_screenshots and (
+            (not needs_tools)
+            or (not decision_json.get("tool_calls"))
+        ):
+
+            needs_tools = True
+            decision_json["needs_tools"] = True
+
+            if not decision_json.get("tool_calls"):
+
+                decision_json["tool_calls"] = (
+                    default_wide_tool_plan()
+                )
 
         # =================================================
         # STEP 3: Normal conversation
@@ -675,7 +897,10 @@ User message:
 {request.message}
 """
 
-            response = call_gemini(normal_prompt)
+            response = call_gemini(
+                normal_prompt,
+                inline_visuals,
+            )
 
             # Handle Gemini errors
             if response.get("error"):
@@ -883,6 +1108,255 @@ User message:
                             failed,
                             limit=10
                         )
+                    )
+
+            # =================================================
+            # Pod diagnostics
+            # =================================================
+
+            elif tool == "get_pod_details":
+
+                phase = (
+                    result.get("phase")
+                    or "?"
+                )
+
+                summary.append(
+                    f"Pod detail {result.get('namespace')}/"
+                    f"{result.get('pod_name')}: phase={phase}, "
+                    f"node={result.get('node_name')}"
+                )
+
+                bad_bits = []
+
+                for row in (
+                    (result.get("containers") or [])
+                    + (result.get("init_containers") or [])
+                ):
+
+                    if row.get("waiting"):
+
+                        w = row["waiting"]
+
+                        bad_bits.append(
+                            f"{row.get('name')}: "
+                            f"waiting="
+                            f"{w.get('reason')}"
+                        )
+
+                    if row.get("terminated"):
+
+                        t = row["terminated"]
+
+                        if (
+                            t.get("exit_code")
+                            not in (None, 0)
+                        ):
+
+                            bad_bits.append(
+                                f"{row.get('name')}: "
+                                f"exit={t.get('exit_code')} "
+                                f"{t.get('reason')}"
+                            )
+
+                if bad_bits:
+
+                    summary.append(
+                        "Container signals: "
+                        + safe_join(
+                            bad_bits,
+                            limit=6,
+                        )
+                    )
+
+                warns = []
+
+                for cond in (
+                    result.get("conditions") or []
+                ):
+
+                    if (
+                        cond.get("status") == "False"
+                        and (
+                            cond.get("type")
+                            in (
+                                "Ready",
+                                "ContainersReady",
+                                "PodScheduled",
+                            )
+                        )
+                    ):
+
+                        warns.append(
+                            f"{cond.get('type')} "
+                            f"({cond.get('reason')}): "
+                            f"{cond.get('message', '')}"
+                        )
+
+                if warns:
+
+                    summary.append(
+                        "Blocking conditions: "
+                        + safe_join(
+                            warns,
+                            limit=3,
+                        )
+                    )
+
+            elif tool == "get_logs":
+
+                logs_blob = (
+                    result.get("logs")
+                    or ""
+                )
+
+                line_estimate = (
+                    logs_blob.count("\n")
+                    + (1 if logs_blob else 0)
+                )
+
+                tail_meta = []
+
+                tail_meta.append(
+                    f"{line_estimate} lines (tail="
+                    f"{result.get('tail_lines', '?')})"
+                )
+
+                if result.get("previous_container"):
+
+                    tail_meta.append("previous crashed container")
+
+                if result.get("timestamps"):
+
+                    tail_meta.append("with timestamps")
+
+                summary.append(
+                    f"Logs {result.get('namespace')}/"
+                    f"{result.get('pod')}: "
+                    + ", ".join(tail_meta)
+                )
+
+            elif tool == (
+                "get_deployment_rollout_status"
+            ):
+
+                want = (
+                    result.get(
+                        "replicas_desired",
+                    )
+                    or 0
+                )
+
+                avail = (
+                    result.get(
+                        "available_replicas",
+                    )
+                    or 0
+                )
+
+                summary.append(
+                    f"Deployment {result.get('namespace')}/"
+                    f"{result.get('deployment_name')}: "
+                    f"avail={avail}/"
+                    f"{want}; "
+                    f"unavail="
+                    f"{result.get('unavailable_replicas', 0)}"
+                )
+
+                if result.get("paused"):
+
+                    summary.append(
+                        "Deployment is PAUSED"
+                    )
+
+                dep_msgs = []
+
+                for cd in (
+                    result.get("conditions") or []
+                ):
+
+                    ctype = cd.get("type")
+                    cstat = cd.get("status")
+
+                    if (
+                        ctype == "ReplicaFailure"
+                        and cstat == "True"
+                    ):
+
+                        dep_msgs.append(
+                            f"{ctype}: "
+                            f"{cd.get('message', '')}"
+                        )
+
+                    elif (
+                        ctype in (
+                            "Available",
+                            "Progressing",
+                        )
+                        and cstat == "False"
+                    ):
+
+                        dep_msgs.append(
+                            f"{ctype}: "
+                            f"{cd.get('message', '')}"
+                        )
+
+                if dep_msgs:
+
+                    summary.append(
+                        "Conditions: "
+                        + safe_join(
+                            dep_msgs,
+                            limit=3,
+                        )
+                    )
+
+            elif tool == (
+                "get_config_map_data"
+            ):
+
+                keys_out = (
+                    result.get(
+                        "keys_returned",
+                        [],
+                    )
+                )
+
+                summary.append(
+                    f"ConfigMap {result.get('namespace')}/"
+                    f"{result.get('config_map_name')}: "
+                    f"{len(keys_out)} string keys fetched"
+                )
+
+                truncated = (
+                    result.get(
+                        "value_was_truncated_for_keys",
+                    )
+                    or []
+                )
+
+                if truncated:
+
+                    summary.append(
+                        "CM values clipped (keys): "
+                        + safe_join(
+                            truncated,
+                            limit=10,
+                        )
+                    )
+
+                budget_skip = (
+                    result.get(
+                        "keys_omitted_due_to_budget",
+                    )
+                    or []
+                )
+
+                if budget_skip:
+
+                    summary.append(
+                        "Additional CM keys omitted by budget "
+                        f"({len(budget_skip)})"
                     )
 
             # =================================================
@@ -1250,6 +1724,53 @@ User message:
                     )
 
             # =================================================
+            # FinOps / capacity signals (SKU + Prom bundle)
+            # =================================================
+
+            elif tool == "finops_cluster_signals":
+
+                summary.append(
+                    "FinOps snapshot: "
+                    f"{result.get('node_count')} nodes, "
+                    f"{len(result.get('instance_mix', {}))} instance labels"
+                )
+
+                zmix = result.get("zone_mix") or {}
+
+                if zmix:
+
+                    summary.append(
+                        f"Zones touched: {len(zmix)} AZs"
+                    )
+
+                cloud_hints = (
+                    result.get("cloud_hints") or []
+                )
+
+                if cloud_hints:
+
+                    summary.append(
+                        "Managed nodegroup/pool hints: "
+                        + safe_join(
+                            cloud_hints,
+                            limit=6,
+                        )
+                    )
+
+                prom_rows = result.get("prometheus") or []
+
+                prom_ok = sum(
+                    1
+                    for row in prom_rows
+                    if row.get("result", {}).get("ok") is True
+                )
+
+                summary.append(
+                    f"FinOps Prom probes: {prom_ok}/"
+                    f"{len(prom_rows)} returned data"
+                )
+
+            # =================================================
             # Prometheus bundle snapshot
             # =================================================
 
@@ -1257,36 +1778,50 @@ User message:
 
                 bundle = result.get("bundle", [])
 
-                summary.append(
-                    "Prometheus bundle: "
-                    f"{len(bundle)} canned queries"
+                ok_n = sum(
+                    1
+                    for entry in bundle
+                    if entry.get(
+                        "result",
+                        {},
+                    ).get(
+                        "ok",
+                    )
                 )
 
-                for entry in bundle[:6]:
+                summary.append(
+                    "Prometheus bundle: "
+                    f"{ok_n}/"
+                    f"{len(bundle)} canned queries OK"
+                )
 
-                    label = entry.get("name", "?")
+                miss_labels = []
 
-                    outcome = entry.get("result", {})
+                for entry in bundle:
 
-                    if outcome.get("ok"):
+                    if not entry.get(
+                        "result",
+                        {},
+                    ).get(
+                        "ok",
+                    ):
 
-                        summary.append(
-                            f"- {label}: OK"
+                        miss_labels.append(
+                            entry.get(
+                                "name",
+                                "?",
+                            )
                         )
 
-                    else:
+                if miss_labels:
 
-                        extra = outcome.get(
-                            "status_code"
-                        ) or outcome.get(
-                            "error",
-                            "",
+                    summary.append(
+                        "Prometheus bundle errs: "
+                        + safe_join(
+                            miss_labels,
+                            limit=10,
                         )
-
-                        summary.append(
-                            f"- {label}: ERR "
-                            f"{extra}"
-                        )
+                    )
 
             # =================================================
             # Prometheus
@@ -1348,8 +1883,54 @@ User message:
         # STEP 5B: Ask Gemini to analyze tool data
         # =================================================
 
-        analysis_prompt = f"""
-You are a staff-level SRE answering Kubernetes / GitOps / capacity questions
+        analysis_visual_intro = ""
+
+        visual_scope_notice = ""
+
+        if screenshot_primary_question:
+
+            visual_scope_notice = """
+=========================================================
+SCREENSHOT-FIRST (USER TEXT SHORT OR EMPTY)
+=========================================================
+The user leaned on screenshot(s); do **not** turn this into an infrastructure survey.
+
+• Aim **≤ ~200 words** unless the screenshots plus user text clearly demand a deeper runbook.
+• Use **≤ 2 headings** (### …). Prefer: what the error likely is → what to verify next → stop.
+• **Do not** add “Other observations”, “aside”, “monitoring posture”, capacity-planning asides,
+  Prometheus catalog walk-throughs, or empty-time-series detective work unless that signal **directly**
+  proves or falsifies **the screenshot’s error**.
+• Prometheus / kube-state empties and canned-query failures inside the sandbox are **background noise** here:
+  do **not** mention them at all unless you need them for one sentence to explain the failing **service/path**
+  the user showed.
+"""
+
+        elif inline_visuals:
+
+            visual_scope_notice = """
+=========================================================
+VISUALS PRESENT — STAY ON-ASK
+=========================================================
+Screenshots are clues (exact message, hostname, dashboard). Prefer answering the user’s **stated**
+question plus what the image shows — avoid broad “audit the cluster” narration or filler sections.
+
+"""
+
+        if inline_visuals:
+
+            analysis_visual_intro = f"""
+=========================================================
+SCREENSHOTS / VISUALS (MATCH TO LIVE SIGNALS BELOW)
+=========================================================
+
+Treat pixels as USER-facing evidence only (URLs, hostnames, error text, panels). Tie conclusions to SANDBOX JSON;
+if live data contradicts the image, say so once plainly. Avoid generic remediation not grounded in retrieved data.
+
+{visual_scope_notice}
+"""
+
+        analysis_prompt = f"""{analysis_visual_intro}
+You are a staff-level SRE answering Kubernetes / GitOps questions
 from read-only sandbox data supplied below.
 
 =========================================================
@@ -1360,15 +1941,19 @@ Ground every concrete claim in the JSON data. Internally rely on RAW TOOL OUTPUT
 then the EXECUTIVE SUMMARY. When you write for the USER:
 
 • Write for a human chat: short, direct, pleasant to skim.
-• Default length: about 250–450 words. Go shorter for simple asks; stretch only when the question truly needs depth.
-• Lead with **one short paragraph**: the takeaway + top 2–3 actions.
-• Use at most **3 section headings** (use ### Heading). Skip filler sections entirely.
+• Default length **about 180–340 words**. If the VISUAL-FIRST block above applied, obey its tighter limit.
+• For narrow asks (single error screenshot, single symptom): **prioritize diagnosis + next checks** —
+  omit unrelated tooling outcomes the user never asked about.
+• Lead with **one short paragraph**: the takeaway + top 2–3 actions when relevant.
+• Use at most **3 section headings** (### Heading). **Never** use headings like “Other observations” only to dump
+  tangential findings (Prom scrape gaps, empty kube-state panels, canned PromQL quirks) unrelated to the user’s thread.
 • Use short bullets (**-** item). No wall of bullets — merge overlapping points.
 • **Never** cite tools, endpoints, JSON keys, or phrases like “RAW TOOL OUTPUTS”, “list_pods”,
   “according to EXECUTIVE SUMMARY”, or `(tool: …)`. The user never saw those internals.
 • **Never** duplicate the same observation in multiple sections.
 • Omit “Observed facts / Known issues / Disclaimer” scaffolding unless essential.
-• If metrics are missing or Prom queries failed, say it once in plain language — no sermon on scrape config.
+• If metrics are missing or Prom queries failed, mention **only when** skipping it would confuse the diagnosis you are
+  delivering **for this thread** — never as a standalone monitoring sermon.
 
 =========================================================
 USER REQUEST
@@ -1396,7 +1981,10 @@ Markdown is OK: ### headings, **bold**, hyphen bullets **-**.
 No ASCII tables or HTML. No preamble like “Here's an analysis of…”.
 """
 
-        analysis_response = call_gemini(analysis_prompt)
+        analysis_response = call_gemini(
+            analysis_prompt,
+            inline_visuals,
+        )
 
         # Handle Gemini errors
         if analysis_response.get("error"):

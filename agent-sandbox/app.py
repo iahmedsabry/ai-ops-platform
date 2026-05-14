@@ -14,9 +14,11 @@ from kubernetes.client import (
     AutoscalingV2Api,
     CustomObjectsApi,
 )
+from kubernetes.client.rest import ApiException
 
 # Prometheus HTTP client
 import requests
+from collections import Counter
 
 app = FastAPI()
 
@@ -61,6 +63,26 @@ COMMON_PROM_QUERIES = [
     (
         "kube_pod_status_phase",
         'sum by (namespace, phase) (kube_pod_status_phase{phase=~"Pending|Unknown|Failed"} == 1)'
+    ),
+    (
+        "kube_requests_cpu_namespace",
+        'topk(45, sum by (namespace) ('
+        'kube_pod_container_resource_requests{resource="cpu"}))',
+    ),
+    (
+        "kube_requests_memory_namespace",
+        'topk(45, sum by (namespace) ('
+        'kube_pod_container_resource_requests{resource="memory"}))',
+    ),
+    (
+        "pvc_storage_requests_namespace",
+        'topk(45, sum by (namespace) ('
+        'kube_persistentvolumeclaim_resource_requests_storage_bytes))',
+    ),
+    (
+        "pods_running_namespace",
+        'topk(50, sum by (namespace) '
+        '(kube_pod_status_phase{phase="Running"} == 1))',
     ),
 ]
 
@@ -118,6 +140,37 @@ def _prometheus_query_one(query):
         }
 
 
+def _clamp_int(raw, default, minimum, maximum):
+
+    try:
+
+        value = int(raw)
+
+    except (TypeError, ValueError):
+
+        value = default
+
+    return max(minimum, min(maximum, value))
+
+
+def _truncate_text(text, max_chars):
+
+    if text is None:
+
+        return None
+
+    rendered = str(text)
+
+    if len(rendered) <= max_chars:
+
+        return rendered
+
+    return (
+        rendered[: max_chars - 28]
+        + "\n... [truncated tool-side] ..."
+    )
+
+
 # =========================================================
 # Allowed tools
 # =========================================================
@@ -125,6 +178,9 @@ def _prometheus_query_one(query):
 ALLOWED_TOOLS = {
     "list_pods",
     "get_logs",
+    "get_pod_details",
+    "get_deployment_rollout_status",
+    "get_config_map_data",
     "list_deployments",
     "list_services",
     "list_endpoints",
@@ -135,6 +191,7 @@ ALLOWED_TOOLS = {
     "list_argocd_applications",
     "query_prometheus",
     "prometheus_common_metrics",
+    "finops_cluster_signals",
     "list_stateful_sets",
     "list_daemon_sets",
     "list_cron_jobs",
@@ -317,84 +374,656 @@ def execute(request: ToolRequest):
             "container_name"
         )
 
-        tail_lines = request.arguments.get(
-            "tail_lines",
-            200
+        tail_lines = _clamp_int(
+            request.arguments.get(
+                "tail_lines",
+                200,
+            ),
+            default=200,
+            minimum=1,
+            maximum=2500,
         )
 
-        if pod_name_arg:
+        previous_logs = (
+            bool(
+                request.arguments.get(
+                    "previous_container",
+                    False,
+                )
+            )
+        )
+
+        timestamps_enabled = (
+            bool(
+                request.arguments.get(
+                    "timestamps",
+                    False,
+                )
+            )
+        )
+
+        try:
+
+            if pod_name_arg:
+
+                kw = dict(
+                    name=pod_name_arg,
+                    namespace=namespace,
+                    tail_lines=tail_lines,
+                    previous=previous_logs,
+                    timestamps=timestamps_enabled,
+                )
+
+                if container_name:
+
+                    kw["container"] = container_name
+
+                logs = core_v1.read_namespaced_pod_log(
+                    **kw
+                )
+
+                return {
+                    "tool": "get_logs",
+                    "pod": pod_name_arg,
+                    "namespace": namespace,
+                    "tail_lines": tail_lines,
+                    "previous_container": (
+                        previous_logs
+                    ),
+                    "timestamps": (
+                        timestamps_enabled
+                    ),
+                    "logs": logs,
+                }
+
+            label_selector = (
+                f"app={app_label}"
+                if app_label
+                else ""
+            )
+
+            pods = core_v1.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=label_selector
+            )
+
+            if not pods.items:
+
+                return {
+                    "error": "No pods found"
+                }
+
+            pod_name = None
+
+            for pod in pods.items:
+
+                if pod.status.phase == "Running":
+
+                    pod_name = (
+                        pod.metadata.name
+                    )
+
+                    break
+
+            if not pod_name:
+
+                return {
+                    "error": (
+                        "No running pods found"
+                    )
+                }
 
             kw = dict(
-                name=pod_name_arg,
+                name=pod_name,
                 namespace=namespace,
                 tail_lines=tail_lines,
+                previous=previous_logs,
+                timestamps=timestamps_enabled,
             )
 
             if container_name:
+
                 kw["container"] = container_name
 
-            logs = core_v1.read_namespaced_pod_log(**kw)
+            logs = core_v1.read_namespaced_pod_log(
+                **kw
+            )
 
             return {
                 "tool": "get_logs",
-                "pod": pod_name_arg,
+                "pod": pod_name,
                 "namespace": namespace,
-                "logs": logs,
+                "tail_lines": tail_lines,
+                "previous_container": (
+                    previous_logs
+                ),
+                "timestamps": (
+                    timestamps_enabled
+                ),
+                "logs": logs
             }
 
-        label_selector = (
-            f"app={app_label}"
-            if app_label
-            else ""
-        )
-
-        pods = core_v1.list_namespaced_pod(
-            namespace=namespace,
-            label_selector=label_selector
-        )
-
-        if not pods.items:
-
-            return {
-                "error": "No pods found"
-            }
-
-        pod_name = None
-
-        for pod in pods.items:
-
-            if pod.status.phase == "Running":
-
-                pod_name = (
-                    pod.metadata.name
-                )
-
-                break
-
-        if not pod_name:
+        except ApiException as exc:
 
             return {
                 "error": (
-                    "No running pods found"
-                )
+                    f"k8s {exc.status}: {exc.reason} "
+                    f"{_truncate_text(exc.body, 400)}"
+                ),
             }
 
-        kw = dict(
-            name=pod_name,
-            namespace=namespace,
-            tail_lines=tail_lines,
+    # =====================================================
+    # Tool: get_pod_details
+    # (describe-equivalent subset: probes, exits, waits)
+    # =====================================================
+
+    elif request.tool == "get_pod_details":
+
+        namespace = (
+            request.arguments.get(
+                "namespace",
+                "default",
+            )
         )
 
-        if container_name:
-            kw["container"] = container_name
+        pod_name_arg = (
+            request.arguments.get(
+                "pod_name",
+            )
+        )
 
-        logs = core_v1.read_namespaced_pod_log(**kw)
+        if not pod_name_arg:
+
+            return {
+                "error": "pod_name is required",
+            }
+
+        try:
+
+            pod_obj = core_v1.read_namespaced_pod(
+                pod_name_arg,
+                namespace,
+            )
+
+        except ApiException as exc:
+
+            return {
+                "error": (
+                    f"k8s {exc.status}: {exc.reason} "
+                    f"{_truncate_text(exc.body, 400)}"
+                ),
+            }
+
+        def collect_container_rows(
+            status_list,
+        ):
+
+            rows = []
+
+            if not status_list:
+
+                return rows
+
+            for cs in status_list:
+
+                row = {
+                    "name": cs.name,
+                    "restart_count": (
+                        cs.restart_count
+                    ),
+                    "ready": cs.ready,
+                }
+
+                if cs.state:
+
+                    if cs.state.waiting:
+
+                        wa = cs.state.waiting
+
+                        row["waiting"] = {
+                            "reason": wa.reason,
+                            "message": (
+                                _truncate_text(
+                                    wa.message,
+                                    800,
+                                )
+                            ),
+                        }
+
+                    if cs.state.terminated:
+
+                        te = cs.state.terminated
+
+                        row["terminated"] = {
+                            "exit_code": (
+                                te.exit_code
+                            ),
+                            "reason": te.reason,
+                            "message": (
+                                _truncate_text(
+                                    te.message,
+                                    800,
+                                )
+                            ),
+                        }
+
+                rows.append(row)
+
+            return rows
+
+        condition_rows = []
+
+        for item in pod_obj.status.conditions or []:
+
+            condition_rows.append({
+                "type": item.type,
+                "status": item.status,
+                "reason": item.reason,
+                "message": (
+                    _truncate_text(
+                        item.message,
+                        600,
+                    )
+                ),
+            })
+
+        pvc_names = []
+
+        for vol in pod_obj.spec.volumes or []:
+
+            if (
+                vol.persistent_volume_claim
+                and (
+                    vol.persistent_volume_claim.claim_name
+                )
+            ):
+
+                pvc_names.append(
+                    vol.persistent_volume_claim.claim_name,
+                )
+
+        owners = []
+
+        for ref in (
+            pod_obj.metadata.owner_references
+            or []
+        ):
+
+            owners.append({
+                "kind": ref.kind,
+                "name": ref.name,
+            })
+
+        probes_out = []
+
+        for ctr in pod_obj.spec.containers or []:
+
+            flags = []
+
+            if ctr.liveness_probe:
+
+                flags.append("liveness_probe")
+
+            if ctr.readiness_probe:
+
+                flags.append("readiness_probe")
+
+            if ctr.startup_probe:
+
+                flags.append("startup_probe")
+
+            probes_out.append({
+                "container": ctr.name,
+                "probe_kinds": flags,
+            })
 
         return {
-            "tool": "get_logs",
-            "pod": pod_name,
+            "tool": "get_pod_details",
             "namespace": namespace,
-            "logs": logs
+            "pod_name": pod_name_arg,
+            "phase": pod_obj.status.phase,
+            "qos_class": (
+                pod_obj.status.qos_class
+            ),
+            "pod_ip": pod_obj.status.pod_ip,
+            "host_ip": pod_obj.status.host_ip,
+            "node_name": (
+                pod_obj.spec.node_name
+            ),
+            "conditions": condition_rows,
+            "containers": (
+                collect_container_rows(
+                    pod_obj.status.container_statuses,
+                )
+            ),
+            "init_containers": (
+                collect_container_rows(
+                    pod_obj.status.init_container_statuses,
+                )
+            ),
+            "volume_claims": pvc_names,
+            "owner_references": owners,
+            "probes_defined": probes_out,
+        }
+
+    # =====================================================
+    # Tool: get_deployment_rollout_status
+    # =====================================================
+
+    elif request.tool == "get_deployment_rollout_status":
+
+        namespace = (
+            request.arguments.get(
+                "namespace",
+                "default",
+            )
+        )
+
+        deployment_name = (
+            request.arguments.get(
+                "deployment_name",
+            )
+        )
+
+        if not deployment_name:
+
+            return {
+                "error": (
+                    "deployment_name is required"
+                ),
+            }
+
+        try:
+
+            dep = (
+                apps_v1.read_namespaced_deployment(
+                    deployment_name,
+                    namespace,
+                )
+            )
+
+        except ApiException as exc:
+
+            return {
+                "error": (
+                    f"k8s {exc.status}: {exc.reason} "
+                    f"{_truncate_text(exc.body, 400)}"
+                ),
+            }
+
+        strat = getattr(
+            dep.spec.strategy,
+            "type",
+            None,
+        )
+
+        rev = (
+            (
+                dep.metadata.annotations
+                or {}
+            ).get(
+                "deployment.kubernetes.io/revision",
+            )
+        )
+
+        statuses = (
+            getattr(
+                dep.status,
+                "conditions",
+                None,
+            )
+        )
+
+        cond_rows = []
+
+        for row in statuses or []:
+
+            cond_rows.append({
+                "type": row.type,
+                "status": row.status,
+                "reason": row.reason,
+                "message": (
+                    _truncate_text(
+                        row.message,
+                        600,
+                    )
+                ),
+            })
+
+        return {
+            "tool": "get_deployment_rollout_status",
+            "namespace": namespace,
+            "deployment_name": deployment_name,
+            "replicas_desired": (
+                dep.spec.replicas or 0
+            ),
+            "ready_replicas": (
+                getattr(
+                    dep.status,
+                    "ready_replicas",
+                    None,
+                )
+                or 0
+            ),
+            "updated_replicas": (
+                getattr(
+                    dep.status,
+                    "updated_replicas",
+                    None,
+                )
+                or 0
+            ),
+            "available_replicas": (
+                getattr(
+                    dep.status,
+                    "available_replicas",
+                    None,
+                )
+                or 0
+            ),
+            "unavailable_replicas": (
+                getattr(
+                    dep.status,
+                    "unavailable_replicas",
+                    None,
+                )
+                or 0
+            ),
+            "observed_generation": (
+                getattr(
+                    dep.status,
+                    "observed_generation",
+                    None,
+                )
+            ),
+            "spec_generation": (
+                getattr(
+                    dep.metadata,
+                    "generation",
+                    None,
+                )
+            ),
+            "strategy": strat,
+            "paused": (
+                getattr(
+                    dep.spec,
+                    "paused",
+                    False,
+                )
+            ),
+            "revision_annotation": rev,
+            "conditions": cond_rows,
+        }
+
+    # =====================================================
+    # Tool: get_config_map_data
+    # =====================================================
+
+    elif request.tool == "get_config_map_data":
+
+        namespace = (
+            request.arguments.get(
+                "namespace",
+                "default",
+            )
+        )
+
+        cm_name = (
+            request.arguments.get(
+                "config_map_name",
+            )
+            or (
+                request.arguments.get(
+                    "name",
+                )
+            )
+        )
+
+        if not cm_name:
+
+            return {
+                "error": (
+                    "config_map_name (or name) "
+                    "is required"
+                ),
+            }
+
+        key_filter_raw = (
+            request.arguments.get("keys")
+        )
+
+        if key_filter_raw is None:
+
+            key_filter = None
+
+        elif isinstance(key_filter_raw, list):
+
+            key_filter = {
+                str(k).strip()
+                for k in key_filter_raw
+                if str(k).strip()
+            }
+
+        else:
+
+            key_filter = {
+                str(key_filter_raw).strip(),
+            }
+
+        CM_MAX_KEYS = 32
+
+        VALUE_CAP_INT = (
+            _clamp_int(
+                request.arguments.get(
+                    "max_value_chars",
+                    14000,
+                ),
+                default=14000,
+                minimum=500,
+                maximum=64000,
+            )
+        )
+
+        try:
+
+            cm_obj = core_v1.read_namespaced_config_map(
+                cm_name,
+                namespace,
+            )
+
+        except ApiException as exc:
+
+            return {
+                "error": (
+                    f"k8s {exc.status}: {exc.reason} "
+                    f"{_truncate_text(exc.body, 400)}"
+                ),
+            }
+
+        data_map = cm_obj.data or {}
+
+        omitted_due_budget = []
+
+        truncated_value_keys = []
+
+        extracted = {}
+
+        sorted_keys = sorted(data_map.keys())
+
+        for key in sorted_keys:
+
+            if key_filter is not None and (
+                key not in key_filter
+            ):
+
+                continue
+
+            if len(extracted) >= CM_MAX_KEYS:
+
+                omitted_due_budget.append(key)
+
+                continue
+
+            payload = (
+                data_map[key]
+                or ""
+            )
+
+            display = payload
+
+            if len(display) > VALUE_CAP_INT:
+
+                display = _truncate_text(
+                    display,
+                    VALUE_CAP_INT,
+                )
+
+                truncated_value_keys.append(key)
+
+            extracted[key] = display
+
+        binary_block = getattr(
+            cm_obj,
+            "binary_data",
+            None,
+        ) or {}
+
+        binary_summary = []
+
+        if binary_block:
+
+            for bk in sorted(binary_block.keys()):
+
+                if key_filter is not None and bk not in key_filter:
+
+                    continue
+
+                size = (
+                    len(
+                        binary_block[bk]
+                        or b""
+                    )
+                )
+
+                binary_summary.append(
+                    f"{bk}: <binary {size} bytes>"
+                )
+
+        return {
+            "tool": "get_config_map_data",
+            "namespace": namespace,
+            "config_map_name": cm_name,
+            "keys_returned": list(
+                extracted.keys(),
+            ),
+            "data": extracted,
+            "value_was_truncated_for_keys": (
+                truncated_value_keys
+            ),
+            "keys_omitted_due_to_budget": (
+                omitted_due_budget
+            ),
+            "binary_keys_summary": binary_summary,
         }
 
     # =====================================================
@@ -581,14 +1210,24 @@ def execute(request: ToolRequest):
                     condition.type
                 ] = condition.status
 
+            labels = (
+                node.metadata.labels
+                or {}
+            )
+
+            instance_type_label = (
+                labels.get(
+                    "node.kubernetes.io/instance-type",
+                )
+                or labels.get(
+                    "beta.kubernetes.io/instance-type",
+                )
+            )
+
             results.append({
                 "name": node.metadata.name,
 
-                "instance_type": (
-                    node.metadata.labels.get(
-                        "node.kubernetes.io/instance-type"
-                    )
-                ),
+                "instance_type": instance_type_label,
 
                 "kubernetes_version": (
                     node.status.node_info.kubelet_version
@@ -859,6 +1498,126 @@ def execute(request: ToolRequest):
                 len(bundle_results)
             ),
             "bundle": bundle_results,
+        }
+
+    # =====================================================
+    # Tool: finops_cluster_signals
+    # (cloud-agnostic: node SKUs/zones via labels + Prometheus
+    # requests / PVC signals when kube-state-metrics exists)
+    # =====================================================
+
+    elif request.tool == "finops_cluster_signals":
+
+        nodes_resp = core_v1.list_node()
+        nodes_items = nodes_resp.items
+
+        sku_mix = Counter()
+        zone_mix = Counter()
+        provider_hints = []
+
+        for node in nodes_items:
+
+            labels = (
+                node.metadata.labels
+                or {}
+            )
+
+            sku = (
+                labels.get(
+                    "node.kubernetes.io/instance-type",
+                )
+                or labels.get(
+                    "beta.kubernetes.io/instance-type",
+                )
+                or "unknown"
+            )
+
+            sku_mix[sku] += 1
+
+            zn = (
+                labels.get(
+                    "topology.kubernetes.io/zone",
+                )
+                or labels.get(
+                    "failure-domain.beta.kubernetes.io/zone",
+                )
+                or "unknown"
+            )
+
+            zone_mix[zn] += 1
+
+            for lk in (
+                "eks.amazonaws.com/nodegroup",
+                "cloud.google.com/gke-nodepool",
+                "kubernetes.azure.com/agentpool",
+            ):
+
+                hint = labels.get(lk)
+
+                if hint:
+
+                    provider_hints.append(f"{lk}={hint}")
+
+        fin_queries = [
+            (
+                "requests_cpu_namespace",
+                (
+                    "topk(45, sum by (namespace) ("
+                    "kube_pod_container_resource_requests{resource=\"cpu\"}))"
+                ),
+            ),
+            (
+                "requests_memory_namespace",
+                (
+                    "topk(45, sum by (namespace) ("
+                    "kube_pod_container_resource_requests{resource=\"memory\"}))"
+                ),
+            ),
+            (
+                "pvc_storage_requested_namespace",
+                (
+                    "topk(45, sum by (namespace) ("
+                    "kube_persistentvolumeclaim_resource_requests_"
+                    "storage_bytes))"
+                ),
+            ),
+            (
+                "node_allocatable_cpu_sum",
+                'sum(kube_node_status_allocatable{resource="cpu"})',
+            ),
+            (
+                "node_allocatable_memory_sum",
+                'sum(kube_node_status_allocatable{resource="memory"})',
+            ),
+        ]
+
+        prom_rows = []
+
+        for label_key, pq in fin_queries:
+
+            prom_rows.append({
+                "name": label_key,
+                "query": pq,
+                "result": (
+                    _prometheus_query_one(
+                        pq,
+                    )
+                ),
+            })
+
+        return {
+            "tool": "finops_cluster_signals",
+            "node_count": len(nodes_items),
+            "instance_mix": dict(sku_mix),
+            "zone_mix": dict(zone_mix),
+            "cloud_hints": sorted(
+                list(
+                    frozenset(
+                        provider_hints,
+                    ),
+                ),
+            ),
+            "prometheus": prom_rows,
         }
 
     # =====================================================
