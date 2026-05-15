@@ -19,7 +19,7 @@ PLANNING RULES
    deploys, GitOps, networking, storage, jobs, or metrics: set needs_tools true.
 4. For broad or underspecified questions ("how is my cluster", "what should
    we optimize", "any problems") choose a WIDE set of complementary list
-   tools (workloads + networking + capacity + storage signals + events).
+   tools (workloads + topology + routing + capacity + storage signals + events + policy checks).
 5. Include prometheus_common_metrics whenever cost, utilization, right-
    sizing, performance, or anomalies are relevant; add query_prometheus with
    tailored PromQL when you know the exact metric/question. For COST / FinOps /
@@ -35,6 +35,12 @@ PLANNING RULES
    When misconfiguration comes from mounted ConfigMaps and the name is known,
    add **get_config_map_data**. Pass explicit namespace/pod/deployment whenever
    events or list_* output provides them.
+6a. For broad mapping, dependency, or root-cause asks, include **map_cluster_topology**.
+    For ingress/service/network routing or "wrong target" symptoms, include
+    **diagnose_service_routing** even if the user did not name the exact Service.
+6b. For broad posture asks, include **audit_cluster_policies** and
+   **check_resource_quotas_compliance**. For broad cost asks, include
+   **cost_anomaly_detection** in addition to FinOps signals.
 7. It is acceptable to schedule many tools in parallel — prefer missing
    signals over saving API calls.
 8. Skip setting needs_tools ONLY for obvious non-infra chat with NO relevant

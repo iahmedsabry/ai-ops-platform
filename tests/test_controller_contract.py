@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from agent_controller.gemini_client import GeminiClient
 from agent_controller.main import app
 from agent_controller.sandbox_client import SandboxClient
+from agent_controller.tool_summaries import build_executive_summary
 
 
 @pytest.fixture
@@ -137,3 +138,70 @@ def test_post_chat_tool_path(
     data = r.json()
     assert data.get("mode") == "tool_analysis"
     assert data.get("response") == "Analysis complete."
+
+
+def test_ingress_summary_calls_out_missing_backend_service() -> None:
+    lines = build_executive_summary(
+        [
+            {
+                "tool": "list_ingresses",
+                "result": {
+                    "ingresses": [
+                        {
+                            "name": "backend-ingress",
+                            "namespace": "backend",
+                            "hosts": ["example.internal"],
+                            "invalid_backends": [
+                                {
+                                    "reason": "service_missing",
+                                    "service_name": "backend-outage-drill",
+                                    "host": "example.internal",
+                                    "path": "/backend",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        ]
+    )
+
+    assert any(
+        "missing Service backend-outage-drill" in line
+        for line in lines
+    )
+
+
+def test_routing_summary_calls_out_selector_and_endpoint_issues() -> None:
+    lines = build_executive_summary(
+        [
+            {
+                "tool": "diagnose_service_routing",
+                "result": {
+                    "issues": [
+                        {
+                            "kind": "Service",
+                            "namespace": "backend",
+                            "name": "api",
+                            "reason": "selector_matches_no_pods",
+                        },
+                        {
+                            "kind": "Ingress",
+                            "namespace": "backend",
+                            "name": "api-ing",
+                            "reason": "backend_service_has_no_ready_endpoints",
+                        },
+                    ]
+                },
+            }
+        ]
+    )
+
+    assert any(
+        "selector_matches_no_pods" in line
+        for line in lines
+    )
+    assert any(
+        "backend_service_has_no_ready_endpoints" in line
+        for line in lines
+    )

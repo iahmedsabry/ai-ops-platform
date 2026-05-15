@@ -537,6 +537,8 @@ def build_executive_summary(tool_results):
             )
     
             hosts = []
+
+            broken = []
     
             for ing in ingresses:
     
@@ -548,6 +550,40 @@ def build_executive_summary(tool_results):
     
                     if host is not None:
                         hosts.append(host)
+
+                for bad in (
+                    ing.get(
+                        "invalid_backends",
+                        [],
+                    )
+                ):
+
+                    path = bad.get("path") or "<default>"
+
+                    host = bad.get("host") or "*"
+
+                    service_name = (
+                        bad.get("service_name")
+                        or "?"
+                    )
+
+                    reason = bad.get("reason")
+
+                    if reason == "service_missing":
+
+                        broken.append(
+                            f"{ing.get('namespace')}/"
+                            f"{ing.get('name')} "
+                            f"{host}{path} -> missing Service {service_name}"
+                        )
+
+                    elif reason == "service_has_no_endpoints":
+
+                        broken.append(
+                            f"{ing.get('namespace')}/"
+                            f"{ing.get('name')} "
+                            f"{host}{path} -> Service {service_name} has no endpoints"
+                        )
     
             summary.append(
                 f"Ingresses: "
@@ -563,6 +599,184 @@ def build_executive_summary(tool_results):
                         limit=10
                     )
                 )
+
+            if broken:
+
+                summary.append(
+                    "Broken ingress backends: "
+                    + safe_join(
+                        broken,
+                        limit=10,
+                    )
+                )
+
+        elif tool == "map_cluster_topology":
+
+            namespaces = result.get(
+                "namespaces",
+                [],
+            )
+
+            summary.append(
+                f"Cluster topology: "
+                f"{len(namespaces)} namespaces mapped"
+            )
+
+            dense = []
+
+            for row in namespaces:
+
+                dense.append(
+                    f"{row.get('namespace')}: "
+                    f"{len(row.get('workloads', []))} workloads, "
+                    f"{len(row.get('services', []))} services, "
+                    f"{len(row.get('ingresses', []))} ingresses"
+                )
+
+            if dense:
+
+                summary.append(
+                    "Topology density: "
+                    + safe_join(
+                        dense,
+                        limit=8,
+                    )
+                )
+
+        elif tool == "diagnose_service_routing":
+
+            issues = result.get(
+                "issues",
+                [],
+            )
+
+            summary.append(
+                f"Routing diagnosis: "
+                f"{len(issues)} issues"
+            )
+
+            if issues:
+
+                rendered = []
+
+                for issue in issues:
+
+                    rendered.append(
+                        f"{issue.get('kind')} "
+                        f"{issue.get('namespace')}/"
+                        f"{issue.get('name')}: "
+                        f"{issue.get('reason')}"
+                    )
+
+                summary.append(
+                    "Routing issues: "
+                    + safe_join(
+                        rendered,
+                        limit=10,
+                    )
+                )
+
+        elif tool == "cost_anomaly_detection":
+
+            findings = result.get("findings", [])
+
+            summary.append(
+                f"Cost anomalies: {len(findings)} findings"
+            )
+
+            if findings:
+                summary.append(
+                    "High-cost outliers: "
+                    + safe_join(
+                        [
+                            f"{row.get('namespace')}/{row.get('object')} ({row.get('metric')})"
+                            for row in findings[:10]
+                        ],
+                        limit=10,
+                    )
+                )
+
+        elif tool == "analyze_pod_performance":
+
+            summary.append(
+                f"Pod performance: {result.get('namespace')}/{result.get('pod_name')}"
+            )
+
+        elif tool == "find_slow_queries":
+
+            query_result = result.get("result", {})
+
+            if query_result.get("ok"):
+                summary.append(
+                    f"Slow-query scan: p{result.get('percentile')} query executed"
+                )
+            else:
+                summary.append(
+                    "Slow-query scan: metrics unavailable or query failed"
+                )
+
+        elif tool == "check_pod_disruption_budgets":
+
+            uncovered = result.get(
+                "deployments_without_pdb",
+                [],
+            )
+
+            summary.append(
+                f"PDB coverage: {result.get('pdb_count', 0)} budgets"
+            )
+
+            if uncovered:
+                summary.append(
+                    "Deployments without PDB: "
+                    + safe_join(
+                        [
+                            f"{row.get('namespace')}/{row.get('deployment')}"
+                            for row in uncovered
+                        ],
+                        limit=10,
+                    )
+                )
+
+        elif tool == "check_resource_quotas_compliance":
+
+            missing_quotas = result.get(
+                "missing_resource_quota",
+                [],
+            )
+            missing_limits = result.get(
+                "missing_limit_range",
+                [],
+            )
+
+            summary.append(
+                f"Quota compliance: {len(result.get('namespaces', []))} namespaces checked"
+            )
+
+            if missing_quotas:
+                summary.append(
+                    "Namespaces missing ResourceQuota: "
+                    + safe_join(missing_quotas, limit=10)
+                )
+
+            if missing_limits:
+                summary.append(
+                    "Namespaces missing LimitRange: "
+                    + safe_join(missing_limits, limit=10)
+                )
+
+        elif tool == "audit_cluster_policies":
+
+            policy_summary = result.get("summary", {})
+
+            summary.append(
+                "Policy audit: "
+                f"risky_pods={policy_summary.get('risky_pod_count', 0)}, "
+                f"namespaces_without_network_policy="
+                f"{len(policy_summary.get('namespaces_without_network_policy', []))}, "
+                f"overpermissive_cluster_roles="
+                f"{len(policy_summary.get('overpermissive_cluster_roles', []))}"
+            )
     
         # =================================================
         # Namespaces

@@ -29,7 +29,21 @@ tools:
     detail: Whether Services actually have backing pods.
   - name: list_ingresses
     arguments: {}
-    detail: External hostnames and ingress exposure.
+    detail: External hostnames, path-to-Service routing, and flags for missing backend Services or empty endpoints.
+  - name: map_cluster_topology
+    arguments:
+      namespace: optional; restrict graph to one namespace
+    detail: >-
+      Cross-resource topology map: workloads, Services, selectors, matching Pods, endpoints, and Ingress routes.
+      Use for broad environment mapping and evidence-based dependency analysis.
+  - name: diagnose_service_routing
+    arguments:
+      namespace: optional; restrict diagnosis to one namespace
+      service_name: optional; focus on one Service
+      ingress_name: optional; focus on one Ingress
+    detail: >-
+      Routing diagnosis: flags missing backend Services, selectors that match no Pods, and Services with zero ready endpoints.
+      Use for ingress, service, connectivity, and traffic root-cause analysis.
   - name: list_namespaces
     arguments: {}
     detail: Namespace inventory and phase.
@@ -110,3 +124,186 @@ tools:
       Summarizes node SKU mix across zones plus optional cloud/node-pool hints (AWS EKS/GKE/AKS labels when present)
       and Prometheus signals for requests vs allocations (PVC, CPU/memory requests, allocatables) — works wherever standard
       kube-state-metrics + cAdvisor-compatible series exist.
+
+  # ========== TROUBLESHOOTING TOOLS ==========
+  - name: trace_pod_dependencies
+    arguments:
+      namespace: "optional; default all namespaces"
+      pod_name: "optional; if provided, show what this pod connects to"
+      app_label: "optional; filter by label"
+    detail: >-
+      Pod communication map: outbound Services called, upstream Services receiving traffic, DNS resolution patterns,
+      network egress points. Use for debugging connectivity issues, tracing call chains, understanding service mesh integration.
+
+  - name: analyze_crash_loop
+    arguments:
+      namespace: "required"
+      pod_name: "required; pod in CrashLoopBackOff or similar error state"
+      check_liveness_probe: "optional boolean; examine probe config"
+      check_resource_limits: "optional boolean; check if OOMKilled"
+    detail: >-
+      Crash analysis: exit codes, termination messages, readiness/liveness probe failures, resource limits,
+      previous container logs, recent events. Use BEFORE fetching logs to save time on root cause.
+
+  - name: event_history
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      hours_back: "optional int; default 24"
+      severity: "optional string; Warning, Error, or both (default)"
+      object_type: "optional; Pod, Node, Deployment, etc."
+    detail: >-
+      Event timeline: cluster incidents, node pressures, pod failures, quota violations. Includes event counts and trends.
+      Use to understand what happened during an outage or degradation period.
+
+  # ========== COST & EFFICIENCY TOOLS ==========
+  - name: cost_breakdown_by_namespace
+    arguments:
+      include_storage: "optional boolean; include PVC/PV costs"
+      include_compute: "optional boolean; include CPU/memory allocation costs (default true)"
+      include_network: "optional boolean; include LB/NAT costs where available"
+    detail: >-
+      Cost estimate per namespace: CPU/memory reserved vs used, storage claims, egress/LB costs (if available in Prometheus).
+      Helps identify cost drivers and over-provisioned workloads. Based on node pricing + resource allocation.
+
+  - name: resource_efficiency_analysis
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      threshold_percent: "optional int; default 20 (flag workloads using <20% of requests)"
+      include_hpa: "optional boolean; check if HPA can improve efficiency"
+    detail: >-
+      Over-provisioning scan: workloads requesting far more than they use, single-replica deployments that could scale,
+      idle StatefulSets. Highlights rightsizing opportunities and waste.
+
+  - name: cost_anomaly_detection
+    arguments:
+      metric: "optional; cpu_requests, memory_requests, storage_size (default all)"
+      percentile_threshold: "optional int; default 80 (flag values above 80th percentile)"
+    detail: >-
+      Detect cost outliers: unusually high requests, large PVCs, expensive node types. Use for budget planning and
+      identifying candidates for optimization.
+
+  # ========== SECURITY & COMPLIANCE TOOLS ==========
+  - name: analyze_rbac
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      role_name: "optional; specific role to audit"
+      include_bindings: "optional boolean; show all role bindings (default true)"
+      check_overpermissive: "optional boolean; flag wildcards and broad permissions"
+    detail: >-
+      RBAC audit: role definitions, service account permissions, ClusterRole bindings, policy violations.
+      Identifies over-permissive roles and least-privilege violations. Does not read user credentials.
+
+  - name: check_network_policies
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      pod_name: "optional; specific pod network policy scope"
+      report_gaps: "optional boolean; flag pods with no NetworkPolicy (default true)"
+    detail: >-
+      Network segmentation: ingress/egress rules, which pods are isolated, which have open traffic.
+      Identifies unprotected workloads and lateral movement risks.
+
+  - name: analyze_pod_security
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      check_root_user: "optional boolean; flag containers running as root (default true)"
+      check_privileged: "optional boolean; flag privileged containers (default true)"
+      check_read_only_fs: "optional boolean; flag writable root filesystems (default true)"
+    detail: >-
+      Pod security posture: containers running as root, privileged mode, read-only root FS, security contexts,
+      capability drops. Flags risky configurations and CIS benchmark violations.
+
+  - name: list_secrets_audit
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      report_mounted: "optional boolean; which Secrets mounted in pods (no content) (default true)"
+      check_rotation_policy: "optional boolean; flag Secrets with no rotation metadata"
+    detail: >-
+      Secret audit (READ-ONLY): Secret names, references in Pods/Deployments, age, mounted locations.
+      Does NOT return Secret values. Use for compliance audits and rotation planning.
+
+  - name: analyze_image_security
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      check_image_pull_policy: "optional boolean; flag non-IfNotPresent policies (default true)"
+      check_registry_source: "optional boolean; flag non-allowlisted registries"
+      check_latest_tag: "optional boolean; flag :latest or untagged images (default true)"
+    detail: >-
+      Container image security: image sources, pull policies, tag freshness, registry compliance.
+      Identifies supply chain risks and policy violations.
+
+  # ========== PERFORMANCE & OPTIMIZATION TOOLS ==========
+  - name: identify_resource_bottlenecks
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      metric: "optional; cpu, memory, disk, network (default all)"
+      time_window_minutes: "optional int; default 60 (analyze last 60 min)"
+    detail: >-
+      Performance constraints: workloads hitting resource limits, nodes with high utilization,
+      I/O-bound pods, network saturation. Use for capacity planning and scaling decisions.
+
+  - name: analyze_pod_performance
+    arguments:
+      namespace: "required"
+      pod_name: "required"
+      metric: "optional; cpu, memory, network (default all)"
+      time_window_minutes: "optional int; default 60"
+    detail: >-
+      Pod metrics timeline: CPU/memory usage, network in/out, restarts, latency percentiles (if Prometheus has traces).
+      Use to understand pod behavior and identify performance regressions.
+
+  - name: find_slow_queries
+    arguments:
+      search_labels: "optional dict; app=myapp, tier=database for targeting"
+      percentile: "optional int; default 95 (queries slower than 95th percentile)"
+    detail: >-
+      Database/service query analysis from Prometheus metrics: slow query rate, high latency endpoints,
+      query count trends. Use for identifying bottlenecks in data paths.
+
+  # ========== COMPLIANCE & AUDIT TOOLS ==========
+  - name: check_pod_disruption_budgets
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      check_coverage: "optional boolean; flag deployments with no PDB (default true)"
+    detail: >-
+      PDB coverage: which workloads have disruption budgets, which are unprotected during maintenance.
+      Use for ensuring high availability during node drains.
+
+  - name: check_resource_quotas_compliance
+    arguments:
+      namespace: "optional; cluster-wide if omitted"
+      check_limits: "optional boolean; flag missing LimitRanges (default true)"
+    detail: >-
+      Namespace quota compliance: hard limits, current usage, overallocation risks.
+      Identifies namespaces without proper resource governance.
+
+  - name: audit_cluster_policies
+    arguments:
+      policy_type: "optional; psp, pdb, npol, rbac (default: all)"
+      severity: "optional; critical, high, medium, low"
+    detail: >-
+      Cluster policy audit: Pod Security Policy violations, missing PDBs, open NetworkPolicies, RBAC gaps.
+      Executive summary of policy compliance posture.
+
+  - name: cluster_health_summary
+    arguments: {}
+    detail: >-
+      Quick cluster status: node readiness, system component health (kube-dns, kube-proxy), API responsiveness,
+      critical workload status. Use for cluster-wide health checks.
+
+  # ========== GITOPS & DEPLOYMENT TOOLS ==========
+  - name: analyze_argocd_sync_status
+    arguments:
+      app_name: "optional; specific ArgoCD application"
+      check_drift: "optional boolean; flag config drift (default true)"
+    detail: >-
+      ArgoCD application status: sync state, last sync time, drift detection, health conditions.
+      Use for monitoring GitOps deployment health and identifying out-of-sync states.
+
+  - name: get_deployment_history
+    arguments:
+      namespace: "required"
+      deployment_name: "required"
+      limit: "optional int; max 50 rollouts to show"
+    detail: >-
+      Deployment rollout history: previous revisions, rollback candidates, replica progression over time.
+      Use for debugging failed deployments or comparing versions.

@@ -5,6 +5,13 @@ from __future__ import annotations
 
 def default_wide_tool_plan() -> list[dict]:
     return [
+        {"tool": "cluster_health_summary", "arguments": {}},
+        {"tool": "map_cluster_topology", "arguments": {}},
+        {"tool": "diagnose_service_routing", "arguments": {}},
+        {"tool": "audit_cluster_policies", "arguments": {}},
+        {"tool": "check_resource_quotas_compliance", "arguments": {}},
+        {"tool": "check_pod_disruption_budgets", "arguments": {}},
+        {"tool": "cost_anomaly_detection", "arguments": {}},
         {"tool": "list_pods", "arguments": {}},
         {"tool": "list_deployments", "arguments": {}},
         {"tool": "list_stateful_sets", "arguments": {}},
@@ -75,6 +82,13 @@ KUBERNETES_KEYWORDS = [
     "connectivity",
     "traffic",
     "routing",
+    "dependency",
+    "dependencies",
+    "topology",
+    "graph",
+    "relationship",
+    "relationships",
+    "root cause",
     "network",
     "pvc",
     "persistent",

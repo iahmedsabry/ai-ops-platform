@@ -22,6 +22,11 @@ then the EXECUTIVE SUMMARY. When you write for the USER:
 • Omit “Observed facts / Known issues / Disclaimer” scaffolding unless essential.
 • If metrics are missing or Prom queries failed, mention **only when** skipping it would confuse the diagnosis you are
   delivering **for this thread** — never as a standalone monitoring sermon.
+• When naming a root cause, clearly distinguish **confirmed**, **likely**, and **possible** causes.
+• If the evidence does not fully prove the root cause, say what is missing instead of guessing.
+• State confidence as high / medium / low when the user is asking for diagnosis, risk, or recommendation.
+• Prefer cross-resource explanations: connect workload -> Service -> endpoints -> Ingress, or request/usage -> node capacity,
+  or role/binding -> effective exposure, rather than isolated facts.
 
 <<<PROMPT_FOCUS_SEPARATOR>>>
 =========================================================

@@ -1,1 +1,1 @@
-Prioritize networking: **list_services**, **list_endpoints**, **list_ingresses**, and **list_events** for Service/Ingress routing and empty-endpoint symptoms. Tie findings to namespaces and names from tool JSON.
+Prioritize networking: **list_services**, **list_endpoints**, **list_ingresses**, and **list_events** for Service/Ingress routing, missing backend Service names, and empty-endpoint symptoms. Tie findings to namespaces, paths, hosts, and concrete names from tool JSON.

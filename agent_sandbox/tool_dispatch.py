@@ -1,6 +1,7 @@
 ﻿"""Per-tool cluster reads; one dispatch function until split into registry callables."""
 from kubernetes.client.rest import ApiException
 import requests
+import datetime
 from collections import Counter
 
 from agent_sandbox.clients import (
@@ -17,6 +18,133 @@ from agent_sandbox.clients import (
     _prometheus_query_one,
     _truncate_text,
 )
+
+
+def _labels_match_selector(labels, selector):
+    if not selector:
+        return False
+    pod_labels = labels or {}
+    for key, value in selector.items():
+        if pod_labels.get(key) != value:
+            return False
+    return True
+
+
+def _service_port_value(service_port):
+    return (
+        getattr(service_port, "number", None)
+        or getattr(service_port, "name", None)
+    )
+
+
+def _parse_cpu_to_cores(value):
+    if value in (None, ""):
+        return 0.0
+    text = str(value).strip()
+    if text.endswith("m"):
+        return float(text[:-1]) / 1000.0
+    return float(text)
+
+
+def _parse_bytes(value):
+    if value in (None, ""):
+        return 0.0
+    text = str(value).strip()
+    units = {
+        "Ki": 1024,
+        "Mi": 1024 ** 2,
+        "Gi": 1024 ** 3,
+        "Ti": 1024 ** 4,
+        "Pi": 1024 ** 5,
+        "K": 1000,
+        "M": 1000 ** 2,
+        "G": 1000 ** 3,
+        "T": 1000 ** 4,
+        "P": 1000 ** 5,
+    }
+    for suffix, multiplier in units.items():
+        if text.endswith(suffix):
+            return float(text[:-len(suffix)]) * multiplier
+    return float(text)
+
+
+def _percentile_threshold(values, percentile):
+    if not values:
+        return 0.0
+    ranked = sorted(values)
+    idx = int((len(ranked) - 1) * (percentile / 100.0))
+    return ranked[idx]
+
+
+def _build_service_topology(namespace=None):
+    if namespace:
+        pods = core_v1.list_namespaced_pod(namespace).items
+        services = core_v1.list_namespaced_service(namespace).items
+        endpoints = core_v1.list_namespaced_endpoints(namespace).items
+        ingresses = networking_v1.list_namespaced_ingress(namespace).items
+        deployments = apps_v1.list_namespaced_deployment(namespace).items
+        stateful_sets = apps_v1.list_namespaced_stateful_set(namespace).items
+        daemon_sets = apps_v1.list_namespaced_daemon_set(namespace).items
+    else:
+        pods = core_v1.list_pod_for_all_namespaces().items
+        services = core_v1.list_service_for_all_namespaces().items
+        endpoints = core_v1.list_endpoints_for_all_namespaces().items
+        ingresses = networking_v1.list_ingress_for_all_namespaces().items
+        deployments = apps_v1.list_deployment_for_all_namespaces().items
+        stateful_sets = apps_v1.list_stateful_set_for_all_namespaces().items
+        daemon_sets = apps_v1.list_daemon_set_for_all_namespaces().items
+
+    pod_index = {}
+
+    for pod in pods:
+        ns = pod.metadata.namespace
+        pod_index.setdefault(ns, []).append(pod)
+
+    endpoint_index = {}
+
+    for endpoint in endpoints:
+        key = (
+            endpoint.metadata.namespace,
+            endpoint.metadata.name,
+        )
+        addresses = []
+        not_ready = []
+        for subset in endpoint.subsets or []:
+            for addr in subset.addresses or []:
+                addresses.append(addr.ip)
+            for addr in subset.not_ready_addresses or []:
+                not_ready.append(addr.ip)
+        endpoint_index[key] = {
+            "ready_addresses": addresses,
+            "not_ready_addresses": not_ready,
+        }
+
+    workload_index = {}
+
+    for workload_kind, items in (
+        ("Deployment", deployments),
+        ("StatefulSet", stateful_sets),
+        ("DaemonSet", daemon_sets),
+    ):
+        for item in items:
+            selector = (
+                getattr(item.spec.selector, "match_labels", None)
+                or {}
+            )
+            workload_index.setdefault(item.metadata.namespace, []).append({
+                "kind": workload_kind,
+                "name": item.metadata.name,
+                "selector": selector,
+            })
+
+    return {
+        "pods": pods,
+        "pod_index": pod_index,
+        "services": services,
+        "ingresses": ingresses,
+        "endpoint_index": endpoint_index,
+        "workload_index": workload_index,
+    }
 
 
 def dispatch_tool(tool: str, arguments: dict):
@@ -906,10 +1034,48 @@ def dispatch_tool(tool: str, arguments: dict):
 
     elif tool == "list_ingresses":
 
+        services = core_v1.list_service_for_all_namespaces()
+
+        endpoints = (
+            core_v1
+            .list_endpoints_for_all_namespaces()
+        )
+
         ingresses = (
             networking_v1
             .list_ingress_for_all_namespaces()
         )
+
+        existing_services = {
+            (
+                svc.metadata.namespace,
+                svc.metadata.name,
+            )
+            for svc in services.items
+        }
+
+        endpoint_addresses = {}
+
+        for ep in endpoints.items:
+
+            addresses = []
+
+            if ep.subsets:
+
+                for subset in ep.subsets:
+
+                    if subset.addresses:
+
+                        for addr in subset.addresses:
+
+                            addresses.append(addr.ip)
+
+            endpoint_addresses[
+                (
+                    ep.metadata.namespace,
+                    ep.metadata.name,
+                )
+            ] = addresses
 
         results = []
 
@@ -917,18 +1083,170 @@ def dispatch_tool(tool: str, arguments: dict):
 
             hosts = []
 
+            backend_refs = []
+
+            invalid_backends = []
+
+            if getattr(ing.spec, "default_backend", None):
+
+                default_backend = ing.spec.default_backend
+
+                if getattr(default_backend, "service", None):
+
+                    service_name = (
+                        default_backend.service.name
+                    )
+
+                    service_key = (
+                        ing.metadata.namespace,
+                        service_name,
+                    )
+
+                    addresses = endpoint_addresses.get(
+                        service_key,
+                        [],
+                    )
+
+                    backend_row = {
+                        "host": None,
+                        "path": None,
+                        "path_type": None,
+                        "service_name": service_name,
+                        "service_port": (
+                            getattr(
+                                default_backend.service.port,
+                                "number",
+                                None,
+                            )
+                            or getattr(
+                                default_backend.service.port,
+                                "name",
+                                None,
+                            )
+                        ),
+                        "service_exists": (
+                            service_key in existing_services
+                        ),
+                        "endpoint_count": len(addresses),
+                        "has_endpoints": bool(addresses),
+                    }
+
+                    backend_refs.append(backend_row)
+
+                    if not backend_row["service_exists"]:
+
+                        invalid_backends.append({
+                            "reason": "service_missing",
+                            "service_name": service_name,
+                            "host": None,
+                            "path": None,
+                        })
+
+                    elif not backend_row["has_endpoints"]:
+
+                        invalid_backends.append({
+                            "reason": "service_has_no_endpoints",
+                            "service_name": service_name,
+                            "host": None,
+                            "path": None,
+                        })
+
             if ing.spec.rules:
 
                 for rule in ing.spec.rules:
 
                     hosts.append(rule.host)
 
+                    http_block = getattr(
+                        rule,
+                        "http",
+                        None,
+                    )
+
+                    for path_obj in (
+                        getattr(http_block, "paths", None)
+                        or []
+                    ):
+
+                        backend = getattr(
+                            path_obj,
+                            "backend",
+                            None,
+                        )
+
+                        service = getattr(
+                            backend,
+                            "service",
+                            None,
+                        )
+
+                        if not service:
+                            continue
+
+                        service_name = service.name
+
+                        service_key = (
+                            ing.metadata.namespace,
+                            service_name,
+                        )
+
+                        addresses = endpoint_addresses.get(
+                            service_key,
+                            [],
+                        )
+
+                        backend_row = {
+                            "host": rule.host,
+                            "path": path_obj.path,
+                            "path_type": path_obj.path_type,
+                            "service_name": service_name,
+                            "service_port": (
+                                getattr(
+                                    service.port,
+                                    "number",
+                                    None,
+                                )
+                                or getattr(
+                                    service.port,
+                                    "name",
+                                    None,
+                                )
+                            ),
+                            "service_exists": (
+                                service_key in existing_services
+                            ),
+                            "endpoint_count": len(addresses),
+                            "has_endpoints": bool(addresses),
+                        }
+
+                        backend_refs.append(backend_row)
+
+                        if not backend_row["service_exists"]:
+
+                            invalid_backends.append({
+                                "reason": "service_missing",
+                                "service_name": service_name,
+                                "host": rule.host,
+                                "path": path_obj.path,
+                            })
+
+                        elif not backend_row["has_endpoints"]:
+
+                            invalid_backends.append({
+                                "reason": "service_has_no_endpoints",
+                                "service_name": service_name,
+                                "host": rule.host,
+                                "path": path_obj.path,
+                            })
+
             results.append({
                 "name": ing.metadata.name,
                 "namespace": (
                     ing.metadata.namespace
                 ),
-                "hosts": hosts
+                "hosts": hosts,
+                "backend_services": backend_refs,
+                "invalid_backends": invalid_backends,
             })
 
         return {
@@ -1919,6 +2237,1361 @@ def dispatch_tool(tool: str, arguments: dict):
             "tool": "list_endpoints",
             "count": len(results),
             "endpoints": results
+        }
+
+    # =====================================================
+    # Tool: list_cron_jobs
+    # =====================================================
+    elif tool == "list_cron_jobs":
+        items = batch_v1.list_cron_job_for_all_namespaces().items
+        results = []
+        for cj in items:
+            results.append({
+                "name": cj.metadata.name,
+                "namespace": cj.metadata.namespace,
+                "schedule": cj.spec.schedule,
+                "suspend": getattr(cj.spec, 'suspend', False),
+                "last_schedule": str(cj.status.last_schedule_time or ""),
+                "timezone": getattr(cj.spec, 'timezone', 'UTC'),
+            })
+        return {
+            "tool": "list_cron_jobs",
+            "count": len(results),
+            "cron_jobs": results,
+        }
+
+    # =====================================================
+    # Tool: list_jobs
+    # =====================================================
+    elif tool == "list_jobs":
+        items = batch_v1.list_job_for_all_namespaces().items
+        sorted_items = sorted(
+            items,
+            key=lambda j: j.metadata.creation_timestamp or "",
+            reverse=True
+        )
+        limit = _clamp_int(
+            arguments.get("limit", 120),
+            default=120,
+            minimum=1,
+            maximum=300,
+        )
+        trimmed = sorted_items[:limit]
+        results = []
+        for job in trimmed:
+            status = job.status
+            results.append({
+                "name": job.metadata.name,
+                "namespace": job.metadata.namespace,
+                "active": status.active or 0,
+                "succeeded": status.succeeded or 0,
+                "failed": status.failed or 0,
+                "creation_time": str(job.metadata.creation_timestamp or ""),
+                "completion_time": str(status.completion_time or ""),
+            })
+        return {
+            "tool": "list_jobs",
+            "count": len(results),
+            "jobs": results,
+        }
+
+    # =====================================================
+    # Tool: list_horizontal_pod_autoscalers
+    # =====================================================
+    elif tool == "list_horizontal_pod_autoscalers":
+        items = autoscaling_v2.list_horizontal_pod_autoscaler_for_all_namespaces().items
+        results = []
+        for hpa in items:
+            target = hpa.spec.scale_target_ref
+            metrics = []
+            for metric in (hpa.spec.metrics or []):
+                m_type = metric.type or "unknown"
+                m_info = {"type": m_type}
+                if metric.resource:
+                    m_info["target"] = getattr(metric.resource, 'target', {})
+                metrics.append(m_info)
+            results.append({
+                "name": hpa.metadata.name,
+                "namespace": hpa.metadata.namespace,
+                "target_kind": target.kind,
+                "target_name": target.name,
+                "min_replicas": hpa.spec.min_replicas or 1,
+                "max_replicas": hpa.spec.max_replicas,
+                "current_replicas": hpa.status.current_replicas or 0,
+                "desired_replicas": hpa.status.desired_replicas or 0,
+                "metrics": metrics,
+            })
+        return {
+            "tool": "list_horizontal_pod_autoscalers",
+            "count": len(results),
+            "hpas": results,
+        }
+
+    # =====================================================
+    # Tool: trace_pod_dependencies
+    # =====================================================
+    elif tool == "trace_pod_dependencies":
+        namespace = arguments.get("namespace", "default")
+        pod_name = arguments.get("pod_name")
+        app_label = arguments.get("app_label")
+        
+        try:
+            if pod_name:
+                pods = [core_v1.read_namespaced_pod(pod_name, namespace)]
+            elif app_label:
+                selector = f"app={app_label}"
+                pods = core_v1.list_namespaced_pod(namespace, label_selector=selector).items
+            else:
+                pods = core_v1.list_namespaced_pod(namespace).items
+            
+            dependencies = []
+            for pod in pods:
+                pod_deps = {
+                    "pod_name": pod.metadata.name,
+                    "namespace": pod.metadata.namespace,
+                    "outbound_services": [],
+                    "environment_refs": [],
+                }
+                
+                for container in pod.spec.containers or []:
+                    for env in container.env or []:
+                        if env.value_from and env.value_from.config_map_key_ref:
+                            pod_deps["environment_refs"].append({
+                                "name": env.name,
+                                "source": "ConfigMap",
+                                "source_name": env.value_from.config_map_key_ref.name,
+                            })
+                        elif env.value_from and env.value_from.secret_key_ref:
+                            pod_deps["environment_refs"].append({
+                                "name": env.name,
+                                "source": "Secret",
+                                "source_name": env.value_from.secret_key_ref.name,
+                            })
+                
+                services = core_v1.list_namespaced_service(namespace).items
+                for svc in services:
+                    for port in svc.spec.ports or []:
+                        pod_deps["outbound_services"].append({
+                            "service": svc.metadata.name,
+                            "port": port.port,
+                            "target_port": port.target_port,
+                        })
+                
+                dependencies.append(pod_deps)
+            
+            return {
+                "tool": "trace_pod_dependencies",
+                "namespace": namespace,
+                "dependencies": dependencies,
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+                "details": _truncate_text(exc.body, 400),
+            }
+
+    # =====================================================
+    # Tool: analyze_crash_loop
+    # =====================================================
+    elif tool == "analyze_crash_loop":
+        namespace = arguments.get("namespace")
+        pod_name = arguments.get("pod_name")
+        
+        if not namespace or not pod_name:
+            return {"error": "namespace and pod_name are required"}
+        
+        try:
+            pod = core_v1.read_namespaced_pod(pod_name, namespace)
+            events_list = core_v1.list_namespaced_event(namespace)
+            
+            analysis = {
+                "pod_name": pod_name,
+                "namespace": namespace,
+                "current_phase": pod.status.phase,
+                "containers": [],
+                "recent_events": [],
+            }
+            
+            for container in pod.status.container_statuses or []:
+                container_info = {
+                    "name": container.name,
+                    "ready": container.ready,
+                    "restart_count": container.restart_count,
+                }
+                
+                if container.state.waiting:
+                    container_info["waiting_reason"] = container.state.waiting.reason
+                    container_info["waiting_message"] = _truncate_text(
+                        container.state.waiting.message or "", 600
+                    )
+                
+                if container.state.terminated:
+                    container_info["exit_code"] = container.state.terminated.exit_code
+                    container_info["termination_reason"] = container.state.terminated.reason
+                    container_info["termination_message"] = _truncate_text(
+                        container.state.terminated.message or "", 600
+                    )
+                
+                analysis["containers"].append(container_info)
+            
+            for event in events_list.items:
+                if event.involved_object.name == pod_name and event.type != "Normal":
+                    analysis["recent_events"].append({
+                        "reason": event.reason,
+                        "message": _truncate_text(event.message or "", 400),
+                        "timestamp": str(event.last_timestamp or event.event_time or ""),
+                    })
+            
+            return {
+                "tool": "analyze_crash_loop",
+                "analysis": analysis,
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+                "details": _truncate_text(exc.body, 400),
+            }
+
+    # =====================================================
+    # Tool: event_history
+    # =====================================================
+    elif tool == "event_history":
+        namespace = arguments.get("namespace")
+        hours_back = arguments.get("hours_back", 24)
+        severity = arguments.get("severity")
+        
+        try:
+            if namespace:
+                events = core_v1.list_namespaced_event(namespace).items
+            else:
+                events = core_v1.list_event_for_all_namespaces().items
+            
+            filtered_events = []
+            for event in events:
+                if severity and event.type not in (severity, "Warning", "Error"):
+                    continue
+                filtered_events.append({
+                    "namespace": event.metadata.namespace,
+                    "type": event.type,
+                    "reason": event.reason,
+                    "message": _truncate_text(event.message or "", 300),
+                    "involved_object": event.involved_object.kind,
+                    "object_name": event.involved_object.name,
+                    "count": event.count or 1,
+                    "timestamp": str(event.last_timestamp or event.event_time or ""),
+                })
+            
+            reason_counts = Counter()
+            for evt in filtered_events:
+                reason_counts[evt["reason"]] += 1
+            
+            return {
+                "tool": "event_history",
+                "total_events": len(filtered_events),
+                "events": filtered_events[:100],
+                "reason_summary": dict(reason_counts.most_common(20)),
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: cost_breakdown_by_namespace
+    # =====================================================
+    elif tool == "cost_breakdown_by_namespace":
+        try:
+            namespaces = core_v1.list_namespace().items
+            breakdown = []
+            
+            for ns in namespaces:
+                ns_name = ns.metadata.name
+                pods = core_v1.list_namespaced_pod(ns_name).items
+                
+                cpu_requests = 0.0
+                memory_requests = 0.0
+                pod_count = 0
+                
+                for pod in pods:
+                    for container in pod.spec.containers or []:
+                        if container.resources and container.resources.requests:
+                            cpu_str = container.resources.requests.get("cpu", "0")
+                            mem_str = container.resources.requests.get("memory", "0")
+                            
+                            try:
+                                cpu_val = float(str(cpu_str).replace("m", "")) / 1000.0 if "m" in str(cpu_str) else float(cpu_str)
+                                memory_val = float(str(mem_str).replace("Mi", "").replace("Gi", "")) 
+                                cpu_requests += cpu_val
+                                memory_requests += memory_val
+                            except:
+                                pass
+                        pod_count += 1
+                
+                breakdown.append({
+                    "namespace": ns_name,
+                    "pod_count": pod_count,
+                    "cpu_requests_cores": round(cpu_requests, 2),
+                    "memory_requests_gb": round(memory_requests / 1024, 2),
+                    "estimated_daily_cost": round((cpu_requests * 0.05 + memory_requests / 1024 * 0.01) * 24, 2),
+                })
+            
+            return {
+                "tool": "cost_breakdown_by_namespace",
+                "breakdown": sorted(breakdown, key=lambda x: x["estimated_daily_cost"], reverse=True),
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: resource_efficiency_analysis
+    # =====================================================
+    elif tool == "resource_efficiency_analysis":
+        namespace = arguments.get("namespace")
+        threshold = arguments.get("threshold_percent", 20)
+        
+        try:
+            if namespace:
+                deployments = apps_v1.list_namespaced_deployment(namespace).items
+            else:
+                deployments = apps_v1.list_deployment_for_all_namespaces().items
+            
+            inefficient = []
+            
+            for dep in deployments:
+                for container in dep.spec.template.spec.containers or []:
+                    if container.resources and container.resources.requests:
+                        requests = container.resources.requests
+                        cpu_req = str(requests.get("cpu", "0"))
+                        
+                        if int(dep.spec.replicas or 1) < 2:
+                            inefficient.append({
+                                "type": "deployment",
+                                "name": dep.metadata.name,
+                                "namespace": dep.metadata.namespace,
+                                "issue": f"Single replica: {dep.spec.replicas or 1} - consider HPA or multi-replica setup",
+                                "severity": "medium",
+                            })
+            
+            return {
+                "tool": "resource_efficiency_analysis",
+                "inefficient_workloads": inefficient,
+                "optimization_count": len(inefficient),
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: analyze_rbac
+    # =====================================================
+    elif tool == "analyze_rbac":
+        namespace = arguments.get("namespace")
+        
+        try:
+            rbac_summary = {
+                "cluster_roles": 0,
+                "cluster_role_bindings": 0,
+                "roles": 0,
+                "role_bindings": 0,
+                "service_accounts": 0,
+                "overpermissive_found": False,
+            }
+            
+            try:
+                crs = custom_api.list_cluster_custom_object(
+                    group="rbac.authorization.k8s.io",
+                    version="v1",
+                    plural="clusterroles"
+                )
+                rbac_summary["cluster_roles"] = len(crs.get("items", []))
+            except:
+                pass
+            
+            try:
+                crbs = custom_api.list_cluster_custom_object(
+                    group="rbac.authorization.k8s.io",
+                    version="v1",
+                    plural="clusterrolebindings"
+                )
+                rbac_summary["cluster_role_bindings"] = len(crbs.get("items", []))
+            except:
+                pass
+            
+            sas = core_v1.list_service_account_for_all_namespaces().items
+            rbac_summary["service_accounts"] = len(sas)
+            
+            return {
+                "tool": "analyze_rbac",
+                "rbac_summary": rbac_summary,
+                "audit_recommendation": "Use least-privilege RBAC with explicit allow rules, avoid wildcards",
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: check_network_policies
+    # =====================================================
+    elif tool == "check_network_policies":
+        namespace = arguments.get("namespace")
+        
+        try:
+            if namespace:
+                nps = networking_v1.list_namespaced_network_policy(namespace).items
+            else:
+                nps = networking_v1.list_network_policy_for_all_namespaces().items
+            
+            policy_summary = {
+                "total_policies": len(nps),
+                "namespaces_with_policies": set(),
+                "pods_likely_unprotected": 0,
+            }
+            
+            for np in nps:
+                policy_summary["namespaces_with_policies"].add(np.metadata.namespace)
+            
+            if namespace:
+                pods = core_v1.list_namespaced_pod(namespace).items
+                policy_ns = set(n.metadata.namespace for np in nps for n in [np])
+                if namespace not in policy_ns:
+                    policy_summary["pods_likely_unprotected"] = len(pods)
+            
+            return {
+                "tool": "check_network_policies",
+                "summary": {
+                    "total_policies": policy_summary["total_policies"],
+                    "namespaces_protected": len(policy_summary["namespaces_with_policies"]),
+                    "recommendation": "Enable NetworkPolicy admission controller and define default-deny egress/ingress",
+                },
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: analyze_pod_security
+    # =====================================================
+    elif tool == "analyze_pod_security":
+        namespace = arguments.get("namespace")
+        
+        try:
+            if namespace:
+                pods = core_v1.list_namespaced_pod(namespace).items
+            else:
+                pods = core_v1.list_pod_for_all_namespaces().items
+            
+            security_issues = []
+            
+            for pod in pods:
+                for container in pod.spec.containers or []:
+                    if container.security_context:
+                        sc = container.security_context
+                        if sc.run_as_user == 0:
+                            security_issues.append({
+                                "pod": pod.metadata.name,
+                                "namespace": pod.metadata.namespace,
+                                "issue": "Running as root (UID 0)",
+                                "severity": "high",
+                            })
+                        if sc.privileged:
+                            security_issues.append({
+                                "pod": pod.metadata.name,
+                                "namespace": pod.metadata.namespace,
+                                "issue": "Running in privileged mode",
+                                "severity": "high",
+                            })
+                        if sc.read_only_root_filesystem is False:
+                            security_issues.append({
+                                "pod": pod.metadata.name,
+                                "namespace": pod.metadata.namespace,
+                                "issue": "Writable root filesystem",
+                                "severity": "medium",
+                            })
+            
+            return {
+                "tool": "analyze_pod_security",
+                "security_issues_found": len(security_issues),
+                "issues": security_issues[:50],
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: list_secrets_audit
+    # =====================================================
+    elif tool == "list_secrets_audit":
+        namespace = arguments.get("namespace")
+        
+        try:
+            if namespace:
+                secrets = core_v1.list_namespaced_secret(namespace).items
+            else:
+                secrets = core_v1.list_secret_for_all_namespaces().items
+            
+            audit_info = []
+            for secret in secrets:
+                audit_info.append({
+                    "name": secret.metadata.name,
+                    "namespace": secret.metadata.namespace,
+                    "type": secret.type,
+                    "key_count": len(secret.data or {}),
+                    "age_days": (
+                        (datetime.datetime.now() - secret.metadata.creation_timestamp.replace(tzinfo=None)).days
+                        if secret.metadata.creation_timestamp else "unknown"
+                    ),
+                })
+            
+            return {
+                "tool": "list_secrets_audit",
+                "total_secrets": len(audit_info),
+                "secrets": audit_info,
+                "note": "Secret values are NOT returned; this is read-only audit only",
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: analyze_image_security
+    # =====================================================
+    elif tool == "analyze_image_security":
+        namespace = arguments.get("namespace")
+        
+        try:
+            if namespace:
+                pods = core_v1.list_namespaced_pod(namespace).items
+            else:
+                pods = core_v1.list_pod_for_all_namespaces().items
+            
+            image_issues = []
+            
+            for pod in pods:
+                for container in pod.spec.containers or []:
+                    image = container.image or ""
+                    
+                    if ":latest" in image or ":" not in image:
+                        image_issues.append({
+                            "pod": pod.metadata.name,
+                            "namespace": pod.metadata.namespace,
+                            "image": image,
+                            "issue": "Using :latest or untagged image",
+                            "severity": "high",
+                        })
+                    
+                    pull_policy = container.image_pull_policy
+                    if pull_policy != "IfNotPresent":
+                        image_issues.append({
+                            "pod": pod.metadata.name,
+                            "namespace": pod.metadata.namespace,
+                            "image": image,
+                            "issue": f"Pull policy is {pull_policy} (should be IfNotPresent)",
+                            "severity": "medium",
+                        })
+            
+            return {
+                "tool": "analyze_image_security",
+                "image_issues_found": len(image_issues),
+                "issues": image_issues[:50],
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: identify_resource_bottlenecks
+    # =====================================================
+    elif tool == "identify_resource_bottlenecks":
+        namespace = arguments.get("namespace")
+        
+        try:
+            if namespace:
+                pods = core_v1.list_namespaced_pod(namespace).items
+            else:
+                pods = core_v1.list_pod_for_all_namespaces().items
+            
+            bottlenecks = []
+            
+            for pod in pods:
+                for container in pod.spec.containers or []:
+                    if container.resources and container.resources.limits:
+                        limits = container.resources.limits
+                        cpu_limit = limits.get("cpu")
+                        mem_limit = limits.get("memory")
+                        
+                        if cpu_limit or mem_limit:
+                            bottlenecks.append({
+                                "pod": pod.metadata.name,
+                                "namespace": pod.metadata.namespace,
+                                "container": container.name,
+                                "cpu_limit": cpu_limit,
+                                "memory_limit": mem_limit,
+                                "status": "resource_constrained",
+                            })
+            
+            return {
+                "tool": "identify_resource_bottlenecks",
+                "bottlenecks_found": len(bottlenecks),
+                "constrained_resources": bottlenecks[:50],
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: analyze_argocd_sync_status
+    # =====================================================
+    elif tool == "analyze_argocd_sync_status":
+        try:
+            apps = custom_api.list_cluster_custom_object(
+                group="argoproj.io",
+                version="v1alpha1",
+                plural="applications"
+            )
+            
+            sync_summary = {
+                "total_apps": len(apps.get("items", [])),
+                "synced": 0,
+                "out_of_sync": 0,
+                "error": 0,
+            }
+            
+            for app in apps.get("items", []):
+                status = app.get("status", {})
+                sync_status = status.get("sync", {}).get("status", "Unknown")
+                
+                if sync_status == "Synced":
+                    sync_summary["synced"] += 1
+                elif sync_status == "OutOfSync":
+                    sync_summary["out_of_sync"] += 1
+                else:
+                    sync_summary["error"] += 1
+            
+            return {
+                "tool": "analyze_argocd_sync_status",
+                "summary": sync_summary,
+            }
+        except:
+            return {
+                "tool": "analyze_argocd_sync_status",
+                "status": "ArgoCD not available in cluster",
+            }
+
+    # =====================================================
+    # Tool: get_deployment_history
+    # =====================================================
+    elif tool == "get_deployment_history":
+        namespace = arguments.get("namespace")
+        deployment_name = arguments.get("deployment_name")
+        limit = arguments.get("limit", 10)
+        
+        if not namespace or not deployment_name:
+            return {"error": "namespace and deployment_name are required"}
+        
+        try:
+            dep = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+            rs_list = apps_v1.list_namespaced_replica_set(namespace).items
+            
+            related_rs = [
+                rs for rs in rs_list
+                if any(
+                    ref.name == deployment_name and ref.kind == "Deployment"
+                    for ref in rs.metadata.owner_references or []
+                )
+            ]
+            
+            history = []
+            for rs in related_rs[:limit]:
+                history.append({
+                    "revision": rs.metadata.annotations.get("deployment.kubernetes.io/revision", "unknown"),
+                    "name": rs.metadata.name,
+                    "replicas": rs.spec.replicas or 0,
+                    "ready_replicas": rs.status.ready_replicas or 0,
+                    "creation_time": str(rs.metadata.creation_timestamp or ""),
+                })
+            
+            return {
+                "tool": "get_deployment_history",
+                "deployment": deployment_name,
+                "namespace": namespace,
+                "history": history,
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: cluster_health_summary
+    # =====================================================
+    elif tool == "cluster_health_summary":
+        try:
+            nodes = core_v1.list_node().items
+            ready_nodes = sum(1 for n in nodes if any(
+                c.type == "Ready" and c.status == "True"
+                for c in n.status.conditions or []
+            ))
+            
+            pods = core_v1.list_pod_for_all_namespaces().items
+            running_pods = sum(1 for p in pods if p.status.phase == "Running")
+            failed_pods = sum(1 for p in pods if p.status.phase == "Failed")
+            
+            return {
+                "tool": "cluster_health_summary",
+                "nodes": {
+                    "total": len(nodes),
+                    "ready": ready_nodes,
+                },
+                "pods": {
+                    "total": len(pods),
+                    "running": running_pods,
+                    "failed": failed_pods,
+                },
+                "health_status": "healthy" if ready_nodes == len(nodes) and failed_pods == 0 else "degraded",
+            }
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+            }
+
+    # =====================================================
+    # Tool: map_cluster_topology
+    # =====================================================
+
+    elif tool == "map_cluster_topology":
+
+        namespace = arguments.get("namespace")
+
+        try:
+            topology = _build_service_topology(namespace)
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+                "details": _truncate_text(exc.body, 400),
+            }
+
+        namespace_rows = {}
+
+        for service in topology["services"]:
+            ns = service.metadata.namespace
+            selector = service.spec.selector or {}
+            matching_pods = []
+
+            for pod in topology["pod_index"].get(ns, []):
+                if _labels_match_selector(
+                    pod.metadata.labels,
+                    selector,
+                ):
+                    matching_pods.append({
+                        "name": pod.metadata.name,
+                        "phase": pod.status.phase,
+                    })
+
+            workloads = []
+            for workload in topology["workload_index"].get(ns, []):
+                if selector and selector == workload["selector"]:
+                    workloads.append({
+                        "kind": workload["kind"],
+                        "name": workload["name"],
+                    })
+
+            endpoint_state = topology["endpoint_index"].get(
+                (ns, service.metadata.name),
+                {
+                    "ready_addresses": [],
+                    "not_ready_addresses": [],
+                },
+            )
+
+            ns_row = namespace_rows.setdefault(ns, {
+                "namespace": ns,
+                "services": [],
+                "ingresses": [],
+                "workloads": [],
+            })
+
+            ns_row["services"].append({
+                "name": service.metadata.name,
+                "type": service.spec.type,
+                "selector": selector,
+                "ports": [
+                    {
+                        "port": port.port,
+                        "target_port": port.target_port,
+                    }
+                    for port in (service.spec.ports or [])
+                ],
+                "matching_pods": matching_pods[:20],
+                "matching_pod_count": len(matching_pods),
+                "backing_workloads": workloads,
+                "ready_endpoint_count": len(
+                    endpoint_state["ready_addresses"]
+                ),
+                "not_ready_endpoint_count": len(
+                    endpoint_state["not_ready_addresses"]
+                ),
+            })
+
+        for ingress in topology["ingresses"]:
+            ns = ingress.metadata.namespace
+            ns_row = namespace_rows.setdefault(ns, {
+                "namespace": ns,
+                "services": [],
+                "ingresses": [],
+                "workloads": [],
+            })
+
+            routes = []
+
+            if getattr(ingress.spec, "default_backend", None):
+                service = getattr(
+                    ingress.spec.default_backend,
+                    "service",
+                    None,
+                )
+                if service:
+                    routes.append({
+                        "host": None,
+                        "path": None,
+                        "service_name": service.name,
+                        "service_port": _service_port_value(service.port),
+                    })
+
+            for rule in ingress.spec.rules or []:
+                for path_obj in (
+                    getattr(rule.http, "paths", None)
+                    or []
+                ):
+                    service = getattr(path_obj.backend, "service", None)
+                    if service:
+                        routes.append({
+                            "host": rule.host,
+                            "path": path_obj.path,
+                            "service_name": service.name,
+                            "service_port": _service_port_value(service.port),
+                        })
+
+            ns_row["ingresses"].append({
+                "name": ingress.metadata.name,
+                "routes": routes,
+            })
+
+        for ns, workloads in topology["workload_index"].items():
+            ns_row = namespace_rows.setdefault(ns, {
+                "namespace": ns,
+                "services": [],
+                "ingresses": [],
+                "workloads": [],
+            })
+            ns_row["workloads"] = workloads
+
+        return {
+            "tool": "map_cluster_topology",
+            "namespace_count": len(namespace_rows),
+            "namespaces": sorted(
+                namespace_rows.values(),
+                key=lambda row: row["namespace"],
+            ),
+        }
+
+    # =====================================================
+    # Tool: diagnose_service_routing
+    # =====================================================
+
+    elif tool == "diagnose_service_routing":
+
+        namespace = arguments.get("namespace")
+        service_name_filter = arguments.get("service_name")
+        ingress_name_filter = arguments.get("ingress_name")
+
+        try:
+            topology = _build_service_topology(namespace)
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+                "details": _truncate_text(exc.body, 400),
+            }
+
+        service_keys = {
+            (
+                service.metadata.namespace,
+                service.metadata.name,
+            )
+            for service in topology["services"]
+        }
+
+        issues = []
+
+        for service in topology["services"]:
+            ns = service.metadata.namespace
+            selector = service.spec.selector or {}
+
+            if service_name_filter and service.metadata.name != service_name_filter:
+                continue
+
+            if not selector:
+                issues.append({
+                    "kind": "Service",
+                    "namespace": ns,
+                    "name": service.metadata.name,
+                    "severity": "warning",
+                    "reason": "selector_missing",
+                    "detail": "Service has no selector; verify it is managed by manual Endpoints or EndpointSlice objects.",
+                })
+                continue
+
+            matching_pods = [
+                pod for pod in topology["pod_index"].get(ns, [])
+                if _labels_match_selector(
+                    pod.metadata.labels,
+                    selector,
+                )
+            ]
+
+            endpoint_state = topology["endpoint_index"].get(
+                (ns, service.metadata.name),
+                {
+                    "ready_addresses": [],
+                    "not_ready_addresses": [],
+                },
+            )
+
+            if not matching_pods:
+                issues.append({
+                    "kind": "Service",
+                    "namespace": ns,
+                    "name": service.metadata.name,
+                    "severity": "critical",
+                    "reason": "selector_matches_no_pods",
+                    "detail": f"Selector {selector} does not match any current Pods.",
+                })
+            elif not endpoint_state["ready_addresses"]:
+                issues.append({
+                    "kind": "Service",
+                    "namespace": ns,
+                    "name": service.metadata.name,
+                    "severity": "critical",
+                    "reason": "no_ready_endpoints",
+                    "detail": f"Service matches {len(matching_pods)} Pods but has 0 ready endpoints.",
+                })
+
+        for ingress in topology["ingresses"]:
+            ns = ingress.metadata.namespace
+
+            if ingress_name_filter and ingress.metadata.name != ingress_name_filter:
+                continue
+
+            def _check_route(service_name, host, path):
+                if service_name_filter and service_name != service_name_filter:
+                    return
+                service_key = (ns, service_name)
+                endpoint_state = topology["endpoint_index"].get(
+                    service_key,
+                    {
+                        "ready_addresses": [],
+                        "not_ready_addresses": [],
+                    },
+                )
+                if service_key not in service_keys:
+                    issues.append({
+                        "kind": "Ingress",
+                        "namespace": ns,
+                        "name": ingress.metadata.name,
+                        "severity": "critical",
+                        "reason": "backend_service_missing",
+                        "detail": f"Route host={host or '*'} path={path or '<default>'} points to missing Service {service_name}.",
+                    })
+                elif not endpoint_state["ready_addresses"]:
+                    issues.append({
+                        "kind": "Ingress",
+                        "namespace": ns,
+                        "name": ingress.metadata.name,
+                        "severity": "critical",
+                        "reason": "backend_service_has_no_ready_endpoints",
+                        "detail": f"Route host={host or '*'} path={path or '<default>'} points to Service {service_name} with 0 ready endpoints.",
+                    })
+
+            if getattr(ingress.spec, "default_backend", None):
+                service = getattr(
+                    ingress.spec.default_backend,
+                    "service",
+                    None,
+                )
+                if service:
+                    _check_route(service.name, None, None)
+
+            for rule in ingress.spec.rules or []:
+                for path_obj in (
+                    getattr(rule.http, "paths", None)
+                    or []
+                ):
+                    service = getattr(path_obj.backend, "service", None)
+                    if service:
+                        _check_route(
+                            service.name,
+                            rule.host,
+                            path_obj.path,
+                        )
+
+        return {
+            "tool": "diagnose_service_routing",
+            "issue_count": len(issues),
+            "issues": issues,
+        }
+
+    # =====================================================
+    # Tool: cost_anomaly_detection
+    # =====================================================
+
+    elif tool == "cost_anomaly_detection":
+
+        percentile = _clamp_int(
+            arguments.get("percentile_threshold", 80),
+            default=80,
+            minimum=50,
+            maximum=99,
+        )
+
+        metrics_requested = arguments.get("metric") or "all"
+
+        pods = core_v1.list_pod_for_all_namespaces().items
+        pvcs = core_v1.list_persistent_volume_claim_for_all_namespaces().items
+
+        cpu_rows = []
+        memory_rows = []
+        storage_rows = []
+
+        for pod in pods:
+            for container in pod.spec.containers or []:
+                requests = container.resources.requests or {}
+                cpu_value = _parse_cpu_to_cores(requests.get("cpu"))
+                memory_value = _parse_bytes(requests.get("memory"))
+                cpu_rows.append({
+                    "namespace": pod.metadata.namespace,
+                    "pod": pod.metadata.name,
+                    "container": container.name,
+                    "value": cpu_value,
+                })
+                memory_rows.append({
+                    "namespace": pod.metadata.namespace,
+                    "pod": pod.metadata.name,
+                    "container": container.name,
+                    "value": memory_value,
+                })
+
+        for pvc in pvcs:
+            requested = (
+                (pvc.spec.resources.requests or {}).get("storage")
+            )
+            storage_rows.append({
+                "namespace": pvc.metadata.namespace,
+                "pvc": pvc.metadata.name,
+                "value": _parse_bytes(requested),
+            })
+
+        findings = []
+
+        def add_findings(metric_name, rows, formatter):
+            threshold = _percentile_threshold(
+                [row["value"] for row in rows if row["value"] > 0],
+                percentile,
+            )
+            if threshold <= 0:
+                return
+            for row in rows:
+                if row["value"] >= threshold and row["value"] > 0:
+                    findings.append(formatter(row, threshold))
+
+        if metrics_requested in ("all", "cpu_requests"):
+            add_findings(
+                "cpu_requests",
+                cpu_rows,
+                lambda row, threshold: {
+                    "metric": "cpu_requests",
+                    "severity": "high" if row["value"] >= threshold * 1.5 else "medium",
+                    "namespace": row["namespace"],
+                    "object": f"{row['pod']}:{row['container']}",
+                    "value": round(row["value"], 3),
+                    "threshold": round(threshold, 3),
+                    "detail": "CPU request is above the configured percentile threshold.",
+                },
+            )
+
+        if metrics_requested in ("all", "memory_requests"):
+            add_findings(
+                "memory_requests",
+                memory_rows,
+                lambda row, threshold: {
+                    "metric": "memory_requests",
+                    "severity": "high" if row["value"] >= threshold * 1.5 else "medium",
+                    "namespace": row["namespace"],
+                    "object": f"{row['pod']}:{row['container']}",
+                    "value_bytes": int(row["value"]),
+                    "threshold_bytes": int(threshold),
+                    "detail": "Memory request is above the configured percentile threshold.",
+                },
+            )
+
+        if metrics_requested in ("all", "storage_size"):
+            add_findings(
+                "storage_size",
+                storage_rows,
+                lambda row, threshold: {
+                    "metric": "storage_size",
+                    "severity": "high" if row["value"] >= threshold * 1.5 else "medium",
+                    "namespace": row["namespace"],
+                    "object": row["pvc"],
+                    "value_bytes": int(row["value"]),
+                    "threshold_bytes": int(threshold),
+                    "detail": "PVC requested storage is above the configured percentile threshold.",
+                },
+            )
+
+        findings.sort(
+            key=lambda row: (
+                row.get("severity") == "high",
+                row.get("value", row.get("value_bytes", 0)),
+            ),
+            reverse=True,
+        )
+
+        return {
+            "tool": "cost_anomaly_detection",
+            "percentile_threshold": percentile,
+            "finding_count": len(findings),
+            "findings": findings[:50],
+        }
+
+    # =====================================================
+    # Tool: analyze_pod_performance
+    # =====================================================
+
+    elif tool == "analyze_pod_performance":
+
+        namespace = arguments.get("namespace")
+        pod_name = arguments.get("pod_name")
+
+        if not namespace or not pod_name:
+            return {"error": "namespace and pod_name are required"}
+
+        prom_queries = {
+            "cpu_5m_cores": (
+                f"sum(rate(container_cpu_usage_seconds_total{{namespace=\"{namespace}\",pod=\"{pod_name}\",container!=\"\",container!=\"POD\"}}[5m]))"
+            ),
+            "memory_working_set_bytes": (
+                f"sum(container_memory_working_set_bytes{{namespace=\"{namespace}\",pod=\"{pod_name}\",container!=\"\",container!=\"POD\"}})"
+            ),
+            "network_receive_bytes_5m": (
+                f"sum(rate(container_network_receive_bytes_total{{namespace=\"{namespace}\",pod=\"{pod_name}\"}}[5m]))"
+            ),
+            "network_transmit_bytes_5m": (
+                f"sum(rate(container_network_transmit_bytes_total{{namespace=\"{namespace}\",pod=\"{pod_name}\"}}[5m]))"
+            ),
+            "restart_count": (
+                f"sum(kube_pod_container_status_restarts_total{{namespace=\"{namespace}\",pod=\"{pod_name}\"}})"
+            ),
+        }
+
+        metrics = []
+        for label, query in prom_queries.items():
+            metrics.append({
+                "name": label,
+                "query": query,
+                "result": _prometheus_query_one(query),
+            })
+
+        return {
+            "tool": "analyze_pod_performance",
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "metrics": metrics,
+        }
+
+    # =====================================================
+    # Tool: find_slow_queries
+    # =====================================================
+
+    elif tool == "find_slow_queries":
+
+        percentile = _clamp_int(
+            arguments.get("percentile", 95),
+            default=95,
+            minimum=50,
+            maximum=99,
+        )
+
+        label_filters = arguments.get("search_labels") or {}
+        matcher = ""
+        for key, value in label_filters.items():
+            matcher += f', {key}=\"{value}\"'
+
+        prom_query = (
+            f"topk(20, histogram_quantile(0.{percentile}, "
+            f"sum by (le, namespace, service, route) ("
+            f"rate({{__name__=~\"http_request_duration_seconds_bucket|http_server_request_duration_seconds_bucket|request_duration_seconds_bucket\"{matcher}}}[5m]))))"
+        )
+
+        return {
+            "tool": "find_slow_queries",
+            "percentile": percentile,
+            "query": prom_query,
+            "result": _prometheus_query_one(prom_query),
+        }
+
+    # =====================================================
+    # Tool: check_pod_disruption_budgets
+    # =====================================================
+
+    elif tool == "check_pod_disruption_budgets":
+
+        namespace = arguments.get("namespace")
+        try:
+            pdb_resp = custom_api.list_cluster_custom_object(
+                group="policy",
+                version="v1",
+                plural="poddisruptionbudgets",
+            )
+            pdb_items = [
+                item for item in pdb_resp.get("items", [])
+                if not namespace or item.get("metadata", {}).get("namespace") == namespace
+            ]
+            deployments = (
+                apps_v1.list_namespaced_deployment(namespace).items
+                if namespace else apps_v1.list_deployment_for_all_namespaces().items
+            )
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+                "details": _truncate_text(exc.body, 400),
+            }
+
+        uncovered = []
+
+        for deployment in deployments:
+            pod_labels = deployment.spec.template.metadata.labels or {}
+            covered = False
+            for pdb in pdb_items:
+                selector = (
+                    pdb.get("spec", {})
+                    .get("selector", {})
+                    .get("matchLabels", {})
+                )
+                if selector and _labels_match_selector(pod_labels, selector):
+                    covered = True
+                    break
+            if not covered:
+                uncovered.append({
+                    "namespace": deployment.metadata.namespace,
+                    "deployment": deployment.metadata.name,
+                })
+
+        return {
+            "tool": "check_pod_disruption_budgets",
+            "pdb_count": len(pdb_items),
+            "deployments_without_pdb": uncovered,
+        }
+
+    # =====================================================
+    # Tool: check_resource_quotas_compliance
+    # =====================================================
+
+    elif tool == "check_resource_quotas_compliance":
+
+        namespace = arguments.get("namespace")
+        namespaces = (
+            [core_v1.read_namespace(namespace)]
+            if namespace else core_v1.list_namespace().items
+        )
+        quota_items = core_v1.list_resource_quota_for_all_namespaces().items
+        limit_items = core_v1.list_limit_range_for_all_namespaces().items
+
+        quota_namespaces = {item.metadata.namespace for item in quota_items}
+        limit_namespaces = {item.metadata.namespace for item in limit_items}
+
+        rows = []
+        for ns in namespaces:
+            rows.append({
+                "namespace": ns.metadata.name,
+                "has_resource_quota": ns.metadata.name in quota_namespaces,
+                "has_limit_range": ns.metadata.name in limit_namespaces,
+            })
+
+        return {
+            "tool": "check_resource_quotas_compliance",
+            "namespaces": rows,
+            "missing_resource_quota": [
+                row["namespace"] for row in rows if not row["has_resource_quota"]
+            ],
+            "missing_limit_range": [
+                row["namespace"] for row in rows if not row["has_limit_range"]
+            ],
+        }
+
+    # =====================================================
+    # Tool: audit_cluster_policies
+    # =====================================================
+
+    elif tool == "audit_cluster_policies":
+
+        try:
+            pods = core_v1.list_pod_for_all_namespaces().items
+            namespaces = core_v1.list_namespace().items
+            network_policies = networking_v1.list_network_policy_for_all_namespaces().items
+            pdb_resp = custom_api.list_cluster_custom_object(
+                group="policy",
+                version="v1",
+                plural="poddisruptionbudgets",
+            )
+            cluster_roles = custom_api.list_cluster_custom_object(
+                group="rbac.authorization.k8s.io",
+                version="v1",
+                plural="clusterroles",
+            )
+        except ApiException as exc:
+            return {
+                "error": f"k8s {exc.status}: {exc.reason}",
+                "details": _truncate_text(exc.body, 400),
+            }
+
+        risky_pods = 0
+        for pod in pods:
+            for container in pod.spec.containers or []:
+                sc = container.security_context
+                if not sc:
+                    continue
+                if sc.privileged or sc.run_as_user == 0 or sc.read_only_root_filesystem is False:
+                    risky_pods += 1
+                    break
+
+        np_namespaces = {item.metadata.namespace for item in network_policies}
+        namespaces_without_np = [
+            ns.metadata.name for ns in namespaces if ns.metadata.name not in np_namespaces
+        ]
+
+        overpermissive_roles = []
+        for role in cluster_roles.get("items", []):
+            for rule in role.get("rules", []):
+                if "*" in rule.get("verbs", []) or "*" in rule.get("resources", []):
+                    overpermissive_roles.append(role.get("metadata", {}).get("name"))
+                    break
+
+        return {
+            "tool": "audit_cluster_policies",
+            "summary": {
+                "risky_pod_count": risky_pods,
+                "namespaces_without_network_policy": namespaces_without_np,
+                "pod_disruption_budget_count": len(pdb_resp.get("items", [])),
+                "overpermissive_cluster_roles": sorted(overpermissive_roles),
+            },
         }
 
     return {
