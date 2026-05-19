@@ -125,6 +125,54 @@ tools:
       and Prometheus signals for requests vs allocations (PVC, CPU/memory requests, allocatables) — works wherever standard
       kube-state-metrics + cAdvisor-compatible series exist.
 
+  - name: aws_cost_overview
+    arguments:
+      start_date: "optional ISO date; defaults to lookback window start"
+      end_date: "optional ISO date; defaults to today and is treated as exclusive"
+      lookback_days: "optional int; default 30"
+      granularity: "optional DAILY or MONTHLY; default DAILY"
+      metric: "optional; UnblendedCost, AmortizedCost, NetUnblendedCost, NetAmortizedCost, BlendedCost"
+      include_forecast: "optional boolean; default true"
+      top_service_limit: "optional int; default 8"
+    detail: >-
+      Real AWS billing overview from Cost Explorer: total spend, time-series trend, top services, and optional forecast.
+      Uses the pod's IAM role or ambient AWS credentials; no static keys should be stored in the app.
+
+  - name: aws_cost_by_service
+    arguments:
+      start_date: "optional ISO date"
+      end_date: "optional ISO date; defaults to today and is treated as exclusive"
+      lookback_days: "optional int; default 30"
+      granularity: "optional DAILY or MONTHLY; default MONTHLY"
+      metric: "optional; UnblendedCost, AmortizedCost, NetUnblendedCost, NetAmortizedCost, BlendedCost"
+      limit: "optional int; default 15"
+    detail: >-
+      Real AWS spend grouped by service from Cost Explorer (for example EC2, EKS, S3, NAT Gateway, CloudWatch).
+      Use for top cost drivers and service-level trend questions.
+
+  - name: aws_cost_by_tag
+    arguments:
+      tag_key: "required cost allocation tag key; for example Environment, Team, Application, CostCenter"
+      start_date: "optional ISO date"
+      end_date: "optional ISO date; defaults to today and is treated as exclusive"
+      lookback_days: "optional int; default 30"
+      granularity: "optional DAILY or MONTHLY; default MONTHLY"
+      metric: "optional; UnblendedCost, AmortizedCost, NetUnblendedCost, NetAmortizedCost, BlendedCost"
+      limit: "optional int; default 20"
+    detail: >-
+      Real AWS spend grouped by a cost allocation tag in Cost Explorer. Requires the tag to be activated in AWS Billing.
+      Use for chargeback or cost ownership by environment, team, application, or cost center.
+
+  - name: aws_cost_forecast
+    arguments:
+      start_date: "optional ISO date; defaults to today"
+      end_date: "optional ISO date; defaults to start_date plus forecast_days"
+      forecast_days: "optional int; default 30"
+      granularity: "optional DAILY or MONTHLY; default MONTHLY"
+      metric: "optional; UnblendedCost, AmortizedCost, NetUnblendedCost, NetAmortizedCost, BlendedCost"
+    detail: >-
+      Real AWS spend forecast from Cost Explorer with prediction intervals. Use for budget outlook and near-term trend planning.
+
   # ========== TROUBLESHOOTING TOOLS ==========
   - name: trace_pod_dependencies
     arguments:
@@ -162,8 +210,8 @@ tools:
       include_compute: "optional boolean; include CPU/memory allocation costs (default true)"
       include_network: "optional boolean; include LB/NAT costs where available"
     detail: >-
-      Cost estimate per namespace: CPU/memory reserved vs used, storage claims, egress/LB costs (if available in Prometheus).
-      Helps identify cost drivers and over-provisioned workloads. Based on node pricing + resource allocation.
+      Cluster cost estimate per namespace: CPU/memory reserved vs used, storage claims, egress/LB costs (if available in Prometheus).
+      Helps identify cost drivers and over-provisioned workloads inside Kubernetes. This is an estimate, not AWS billing truth.
 
   - name: resource_efficiency_analysis
     arguments:

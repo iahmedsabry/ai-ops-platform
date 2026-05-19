@@ -48,7 +48,9 @@ class GeminiClient:
     ) -> dict[str, Any]:
         inlined = inline_images if inline_images is not None else []
         parts = build_gemini_parts_from_inline(prompt, inlined)
+        # PER-ENVIRONMENT: set via Kubernetes Secret in-cluster (e.g. SealedSecret); do not hardcode.
         api_key = os.getenv("GEMINI_API_KEY")
+        # Base URL is Google's API; keep in sync with Settings.gemini_display_api if you introduce a proxy.
         url = (
             "https://generativelanguage.googleapis.com/"
             f"v1beta/models/{self._settings.gemini_model}:generateContent?key={api_key}"

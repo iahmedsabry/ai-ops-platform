@@ -205,3 +205,42 @@ def test_routing_summary_calls_out_selector_and_endpoint_issues() -> None:
         "backend_service_has_no_ready_endpoints" in line
         for line in lines
     )
+
+
+def test_aws_cost_summary_includes_total_and_forecast() -> None:
+    lines = build_executive_summary(
+        [
+            {
+                "tool": "aws_cost_overview",
+                "result": {
+                    "time_period": {
+                        "Start": "2026-04-15",
+                        "End": "2026-05-15",
+                    },
+                    "total_cost": {
+                        "amount": 321.09,
+                        "unit": "USD",
+                    },
+                    "top_services": [
+                        {
+                            "name": "Amazon Elastic Compute Cloud - Compute",
+                            "amount": 120.50,
+                            "unit": "USD",
+                        }
+                    ],
+                    "forecast": {
+                        "mean_value": 355.0,
+                        "unit": "USD",
+                        "time_period": {
+                            "Start": "2026-05-15",
+                            "End": "2026-06-14",
+                        },
+                    },
+                },
+            }
+        ]
+    )
+
+    assert any("321.09 USD" in line for line in lines)
+    assert any("Amazon Elastic Compute Cloud - Compute" in line for line in lines)
+    assert any("355.0 USD" in line for line in lines)

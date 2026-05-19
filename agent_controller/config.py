@@ -1,4 +1,9 @@
-"""Runtime configuration for agent-controller."""
+"""Runtime configuration for agent-controller.
+
+PER-ENVIRONMENT: In production, set these via Kubernetes ConfigMap (see GitOps
+`manifests/agent-controller/app-config.env`). Defaults here are local/dev fallbacks only;
+see `ENVIRONMENT_VALUES.md` at the workspace root.
+"""
 
 from __future__ import annotations
 
@@ -18,10 +23,12 @@ class Settings:
     max_image_bytes: int = int(
         os.getenv("MAX_IMAGE_BYTES", str(4 * 1024 * 1024))
     )
+    # PER-ENVIRONMENT: must be a URL that resolves inside the cluster (service DNS / port).
     sandbox_execute_url: str = os.getenv(
         "SANDBOX_EXECUTE_URL",
         "http://agent-sandbox/execute",
     )
+    # PER-ENVIRONMENT: override only if you use a Google API proxy or non-default endpoint.
     gemini_display_api: str = os.getenv(
         "GEMINI_DISPLAY_API",
         "https://generativelanguage.googleapis.com/v1beta",

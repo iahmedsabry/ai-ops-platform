@@ -11,6 +11,6 @@ terraform {
 # Configure AWS provider
 provider "aws" {
   region  = var.aws_region # AWS region (we can change later)
-  profile = "hands-on"     # AWS credentials local AWS config under this profile
+  profile = var.aws_profile # Optional local AWS profile; null lets the SDK/provider chain resolve dynamically
 }
 

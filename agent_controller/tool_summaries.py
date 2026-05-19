@@ -696,6 +696,90 @@ def build_executive_summary(tool_results):
                     )
                 )
 
+        elif tool == "aws_cost_overview":
+
+            total_cost = result.get("total_cost", {})
+            forecast = result.get("forecast") or {}
+
+            summary.append(
+                "AWS cost overview: "
+                f"{total_cost.get('amount', 0)} {total_cost.get('unit', 'USD')} "
+                f"for {result.get('time_period', {}).get('Start')} to "
+                f"{result.get('time_period', {}).get('End')}"
+            )
+
+            services = result.get("top_services", [])
+            if services:
+                summary.append(
+                    "Top AWS services: "
+                    + safe_join(
+                        [
+                            f"{row.get('name')} ({row.get('amount')} {row.get('unit', 'USD')})"
+                            for row in services[:8]
+                        ],
+                        limit=8,
+                    )
+                )
+
+            if forecast:
+                summary.append(
+                    "AWS forecast: "
+                    f"{forecast.get('mean_value', 0)} {forecast.get('unit', 'USD')} "
+                    f"for {forecast.get('time_period', {}).get('Start')} to "
+                    f"{forecast.get('time_period', {}).get('End')}"
+                )
+
+        elif tool == "aws_cost_by_service":
+
+            services = result.get("services", [])
+
+            summary.append(
+                f"AWS cost by service: {len(services)} services ranked"
+            )
+
+            if services:
+                summary.append(
+                    "Service cost drivers: "
+                    + safe_join(
+                        [
+                            f"{row.get('name')} ({row.get('amount')} {row.get('unit', 'USD')})"
+                            for row in services[:10]
+                        ],
+                        limit=10,
+                    )
+                )
+
+        elif tool == "aws_cost_by_tag":
+
+            groups = result.get("groups", [])
+
+            summary.append(
+                f"AWS cost by tag {result.get('tag_key')}: {len(groups)} groups"
+            )
+
+            if groups:
+                summary.append(
+                    "Tag cost groups: "
+                    + safe_join(
+                        [
+                            f"{row.get('tag_value')} ({row.get('amount')} {row.get('unit', 'USD')})"
+                            for row in groups[:10]
+                        ],
+                        limit=10,
+                    )
+                )
+
+        elif tool == "aws_cost_forecast":
+
+            total = result.get("total_forecast", {})
+
+            summary.append(
+                "AWS cost forecast: "
+                f"{total.get('amount', 0)} {total.get('unit', 'USD')} "
+                f"for {result.get('time_period', {}).get('Start')} to "
+                f"{result.get('time_period', {}).get('End')}"
+            )
+
         elif tool == "analyze_pod_performance":
 
             summary.append(

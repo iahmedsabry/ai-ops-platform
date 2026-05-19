@@ -19,3 +19,8 @@ output "private_subnet_ids" {
 output "alb_controller_role_arn" {
   value = aws_iam_role.alb_controller.arn
 }
+
+output "agent_sandbox_billing_role_arn" {
+  description = "IAM role ARN to annotate on the agent-sandbox ServiceAccount for Cost Explorer access"
+  value       = try(aws_iam_role.agent_sandbox_billing[0].arn, null)
+}

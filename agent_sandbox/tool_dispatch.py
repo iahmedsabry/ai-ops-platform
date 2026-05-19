@@ -6,6 +6,7 @@ from collections import Counter
 
 from agent_sandbox.clients import (
     PROMETHEUS_URL,
+    cost_explorer_client,
     COMMON_PROM_QUERIES,
     apps_v1,
     autoscaling_v2,
@@ -14,6 +15,7 @@ from agent_sandbox.clients import (
     custom_api,
     networking_v1,
     storage_v1,
+    sts_client,
     _clamp_int,
     _prometheus_query_one,
     _truncate_text,
@@ -74,6 +76,176 @@ def _percentile_threshold(values, percentile):
     ranked = sorted(values)
     idx = int((len(ranked) - 1) * (percentile / 100.0))
     return ranked[idx]
+
+
+_ALLOWED_COST_METRICS = {
+    "AmortizedCost",
+    "BlendedCost",
+    "NetAmortizedCost",
+    "NetUnblendedCost",
+    "UnblendedCost",
+    "UsageQuantity",
+}
+
+
+def _parse_iso_date(raw_value):
+    if not raw_value:
+        return None
+    try:
+        return datetime.date.fromisoformat(str(raw_value))
+    except ValueError:
+        return None
+
+
+def _normalize_cost_metric(raw_value):
+    candidate = str(raw_value or "UnblendedCost").strip()
+    if candidate in _ALLOWED_COST_METRICS:
+        return candidate
+    return "UnblendedCost"
+
+
+def _normalize_cost_granularity(raw_value, default="DAILY"):
+    candidate = str(raw_value or default).strip().upper()
+    if candidate in ("DAILY", "MONTHLY"):
+        return candidate
+    return default
+
+
+def _resolve_time_period(arguments, default_days=30):
+    today = datetime.date.today()
+    end_date = _parse_iso_date(arguments.get("end_date")) or today
+    if end_date > today:
+        end_date = today
+
+    lookback_days = _clamp_int(
+        arguments.get("lookback_days", default_days),
+        default=default_days,
+        minimum=1,
+        maximum=365,
+    )
+    start_date = _parse_iso_date(arguments.get("start_date")) or (
+        end_date - datetime.timedelta(days=lookback_days)
+    )
+
+    if start_date >= end_date:
+        start_date = end_date - datetime.timedelta(days=lookback_days)
+
+    return {
+        "Start": start_date.isoformat(),
+        "End": end_date.isoformat(),
+    }
+
+
+def _resolve_forecast_period(arguments, default_days=30):
+    today = datetime.date.today()
+    start_date = _parse_iso_date(arguments.get("start_date")) or today
+    if start_date < today:
+        start_date = today
+
+    forecast_days = _clamp_int(
+        arguments.get("forecast_days", default_days),
+        default=default_days,
+        minimum=1,
+        maximum=365,
+    )
+    end_date = _parse_iso_date(arguments.get("end_date")) or (
+        start_date + datetime.timedelta(days=forecast_days)
+    )
+
+    if end_date <= start_date:
+        end_date = start_date + datetime.timedelta(days=forecast_days)
+
+    return {
+        "Start": start_date.isoformat(),
+        "End": end_date.isoformat(),
+    }
+
+
+def _money_metric_value(metric_map, metric_name):
+    metric_row = metric_map.get(metric_name) or {}
+    try:
+        amount = float(metric_row.get("Amount", 0.0))
+    except (TypeError, ValueError):
+        amount = 0.0
+    return {
+        "amount": round(amount, 2),
+        "unit": metric_row.get("Unit", "USD"),
+    }
+
+
+def _summarize_results_by_time(results_by_time, metric_name):
+    rows = []
+    total_amount = 0.0
+    unit = "USD"
+
+    for row in results_by_time:
+        total_row = _money_metric_value(
+            row.get("Total") or {},
+            metric_name,
+        )
+        unit = total_row["unit"] or unit
+        total_amount += total_row["amount"]
+        rows.append({
+            "start": row.get("TimePeriod", {}).get("Start"),
+            "end": row.get("TimePeriod", {}).get("End"),
+            "amount": total_row["amount"],
+            "unit": unit,
+        })
+
+    return {
+        "total": round(total_amount, 2),
+        "unit": unit,
+        "points": rows,
+    }
+
+
+def _group_totals(results_by_time, metric_name, limit=10):
+    grouped = {}
+    unit = "USD"
+
+    for row in results_by_time:
+        for group in row.get("Groups") or []:
+            keys = group.get("Keys") or []
+            label = keys[0] if keys else "unknown"
+            metric_row = _money_metric_value(
+                group.get("Metrics") or {},
+                metric_name,
+            )
+            unit = metric_row["unit"] or unit
+            grouped[label] = grouped.get(label, 0.0) + metric_row["amount"]
+
+    ranked = sorted(
+        grouped.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    return [
+        {
+            "name": label,
+            "amount": round(amount, 2),
+            "unit": unit,
+        }
+        for label, amount in ranked[:limit]
+    ]
+
+
+def _aws_identity():
+    identity = sts_client().get_caller_identity()
+    return {
+        "account_id": identity.get("Account"),
+        "arn": identity.get("Arn"),
+    }
+
+
+def _billing_error(exc):
+    response = getattr(exc, "response", None) or {}
+    error = response.get("Error") or {}
+    if error:
+        return {
+            "error": f"aws {error.get('Code', 'ClientError')}: {error.get('Message', 'request failed')}",
+        }
+    return {"error": f"aws error: {str(exc)}"}
 
 
 def _build_service_topology(namespace=None):
@@ -2495,6 +2667,258 @@ def dispatch_tool(tool: str, arguments: dict):
             return {
                 "error": f"k8s {exc.status}: {exc.reason}",
             }
+
+    # =====================================================
+    # Tool: aws_cost_overview
+    # =====================================================
+    elif tool == "aws_cost_overview":
+
+        metric_name = _normalize_cost_metric(arguments.get("metric"))
+        granularity = _normalize_cost_granularity(
+            arguments.get("granularity"),
+            default="DAILY",
+        )
+        time_period = _resolve_time_period(arguments, default_days=30)
+        top_service_limit = _clamp_int(
+            arguments.get("top_service_limit", 8),
+            default=8,
+            minimum=1,
+            maximum=20,
+        )
+        include_forecast = bool(arguments.get("include_forecast", True))
+
+        try:
+            ce = cost_explorer_client()
+            summary_response = ce.get_cost_and_usage(
+                TimePeriod=time_period,
+                Granularity=granularity,
+                Metrics=[metric_name],
+            )
+            service_response = ce.get_cost_and_usage(
+                TimePeriod=time_period,
+                Granularity="MONTHLY",
+                Metrics=[metric_name],
+                GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+            )
+
+            forecast = None
+            if include_forecast and metric_name != "UsageQuantity":
+                forecast_period = _resolve_forecast_period(arguments, default_days=30)
+                forecast_response = ce.get_cost_forecast(
+                    TimePeriod=forecast_period,
+                    Metric=metric_name,
+                    Granularity="MONTHLY",
+                )
+                forecast = {
+                    "time_period": forecast_period,
+                    "mean_value": round(
+                        float(forecast_response.get("Total", {}).get("Amount", 0.0)),
+                        2,
+                    ),
+                    "prediction_interval_lower": round(
+                        float(
+                            forecast_response.get("ForecastResultsByTime", [{}])[0]
+                            .get("PredictionIntervalLowerBound", {})
+                            .get("Amount", 0.0)
+                        ),
+                        2,
+                    ) if forecast_response.get("ForecastResultsByTime") else None,
+                    "prediction_interval_upper": round(
+                        float(
+                            forecast_response.get("ForecastResultsByTime", [{}])[-1]
+                            .get("PredictionIntervalUpperBound", {})
+                            .get("Amount", 0.0)
+                        ),
+                        2,
+                    ) if forecast_response.get("ForecastResultsByTime") else None,
+                    "unit": forecast_response.get("Total", {}).get("Unit", "USD"),
+                }
+
+            series = _summarize_results_by_time(
+                summary_response.get("ResultsByTime") or [],
+                metric_name,
+            )
+
+            return {
+                "tool": "aws_cost_overview",
+                "metric": metric_name,
+                "granularity": granularity,
+                "time_period": time_period,
+                "account": _aws_identity(),
+                "total_cost": {
+                    "amount": series["total"],
+                    "unit": series["unit"],
+                },
+                "timeline": series["points"],
+                "top_services": _group_totals(
+                    service_response.get("ResultsByTime") or [],
+                    metric_name,
+                    limit=top_service_limit,
+                ),
+                "forecast": forecast,
+            }
+        except Exception as exc:
+            return _billing_error(exc)
+
+    # =====================================================
+    # Tool: aws_cost_by_service
+    # =====================================================
+    elif tool == "aws_cost_by_service":
+
+        metric_name = _normalize_cost_metric(arguments.get("metric"))
+        granularity = _normalize_cost_granularity(
+            arguments.get("granularity"),
+            default="MONTHLY",
+        )
+        time_period = _resolve_time_period(arguments, default_days=30)
+        limit = _clamp_int(
+            arguments.get("limit", 15),
+            default=15,
+            minimum=1,
+            maximum=50,
+        )
+
+        try:
+            ce = cost_explorer_client()
+            response = ce.get_cost_and_usage(
+                TimePeriod=time_period,
+                Granularity=granularity,
+                Metrics=[metric_name],
+                GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+            )
+
+            return {
+                "tool": "aws_cost_by_service",
+                "metric": metric_name,
+                "granularity": granularity,
+                "time_period": time_period,
+                "account": _aws_identity(),
+                "services": _group_totals(
+                    response.get("ResultsByTime") or [],
+                    metric_name,
+                    limit=limit,
+                ),
+            }
+        except Exception as exc:
+            return _billing_error(exc)
+
+    # =====================================================
+    # Tool: aws_cost_by_tag
+    # =====================================================
+    elif tool == "aws_cost_by_tag":
+
+        tag_key = str(arguments.get("tag_key") or "").strip()
+        if not tag_key:
+            return {"error": "tag_key is required"}
+
+        metric_name = _normalize_cost_metric(arguments.get("metric"))
+        granularity = _normalize_cost_granularity(
+            arguments.get("granularity"),
+            default="MONTHLY",
+        )
+        time_period = _resolve_time_period(arguments, default_days=30)
+        limit = _clamp_int(
+            arguments.get("limit", 20),
+            default=20,
+            minimum=1,
+            maximum=50,
+        )
+
+        try:
+            ce = cost_explorer_client()
+            response = ce.get_cost_and_usage(
+                TimePeriod=time_period,
+                Granularity=granularity,
+                Metrics=[metric_name],
+                GroupBy=[{"Type": "TAG", "Key": tag_key}],
+            )
+
+            grouped = []
+            for row in _group_totals(
+                response.get("ResultsByTime") or [],
+                metric_name,
+                limit=limit,
+            ):
+                grouped.append({
+                    "tag_value": row["name"],
+                    "amount": row["amount"],
+                    "unit": row["unit"],
+                })
+
+            return {
+                "tool": "aws_cost_by_tag",
+                "tag_key": tag_key,
+                "metric": metric_name,
+                "granularity": granularity,
+                "time_period": time_period,
+                "account": _aws_identity(),
+                "groups": grouped,
+            }
+        except Exception as exc:
+            return _billing_error(exc)
+
+    # =====================================================
+    # Tool: aws_cost_forecast
+    # =====================================================
+    elif tool == "aws_cost_forecast":
+
+        metric_name = _normalize_cost_metric(arguments.get("metric"))
+        if metric_name == "UsageQuantity":
+            return {"error": "UsageQuantity is not supported for cost forecast"}
+
+        granularity = _normalize_cost_granularity(
+            arguments.get("granularity"),
+            default="MONTHLY",
+        )
+        forecast_period = _resolve_forecast_period(arguments, default_days=30)
+
+        try:
+            ce = cost_explorer_client()
+            response = ce.get_cost_forecast(
+                TimePeriod=forecast_period,
+                Metric=metric_name,
+                Granularity=granularity,
+            )
+
+            forecast_points = []
+            for row in response.get("ForecastResultsByTime") or []:
+                mean_value = _money_metric_value(
+                    {metric_name: row.get("MeanValue", {})},
+                    metric_name,
+                )
+                lower_bound = _money_metric_value(
+                    {metric_name: row.get("PredictionIntervalLowerBound", {})},
+                    metric_name,
+                )
+                upper_bound = _money_metric_value(
+                    {metric_name: row.get("PredictionIntervalUpperBound", {})},
+                    metric_name,
+                )
+                forecast_points.append({
+                    "start": row.get("TimePeriod", {}).get("Start"),
+                    "end": row.get("TimePeriod", {}).get("End"),
+                    "mean_amount": mean_value["amount"],
+                    "prediction_interval_lower": lower_bound["amount"],
+                    "prediction_interval_upper": upper_bound["amount"],
+                    "unit": mean_value["unit"],
+                })
+
+            total = _money_metric_value(
+                {metric_name: response.get("Total", {})},
+                metric_name,
+            )
+
+            return {
+                "tool": "aws_cost_forecast",
+                "metric": metric_name,
+                "granularity": granularity,
+                "time_period": forecast_period,
+                "account": _aws_identity(),
+                "total_forecast": total,
+                "forecast": forecast_points,
+            }
+        except Exception as exc:
+            return _billing_error(exc)
 
     # =====================================================
     # Tool: cost_breakdown_by_namespace

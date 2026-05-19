@@ -1,9 +1,15 @@
-"""Kubernetes clients, Prometheus URL, and small helpers for tool handlers."""
+"""Kubernetes clients, Prometheus URL, and small helpers for tool handlers.
+
+PER-ENVIRONMENT: AWS regions and Prometheus URL must match the target account/cluster.
+Configure via GitOps `manifests/agent-sandbox/app-config.env` (and IRSA). Defaults below
+are dev fallbacks; see `ENVIRONMENT_VALUES.md` at the workspace root.
+"""
 
 from __future__ import annotations
 
 import os
 
+import boto3
 import requests
 from kubernetes import config
 from kubernetes.client import (
@@ -26,6 +32,41 @@ batch_v1 = BatchV1Api()
 autoscaling_v2 = AutoscalingV2Api()
 custom_api = CustomObjectsApi()
 
+# PER-ENVIRONMENT: set to the AWS region where this workload's IAM role and APIs run.
+AWS_REGION = os.getenv(
+    "AWS_REGION",
+    os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+)
+
+# PER-ENVIRONMENT: Cost Explorer / pricing APIs (often us-east-1 even if workload is elsewhere).
+AWS_BILLING_REGION = os.getenv(
+    "AWS_BILLING_REGION",
+    os.getenv("AWS_COST_EXPLORER_REGION", "us-east-1"),
+)
+
+
+def aws_client(service_name: str, region_name: str | None = None):
+    session = boto3.session.Session()
+    return session.client(
+        service_name,
+        region_name=region_name or AWS_REGION,
+    )
+
+
+def cost_explorer_client(region_name: str | None = None):
+    # Cost Explorer is a billing-plane API; default to AWS_BILLING_REGION unless explicitly overridden.
+    return aws_client("ce", region_name=region_name or AWS_BILLING_REGION)
+
+
+def pricing_client(region_name: str | None = None):
+    return aws_client("pricing", region_name=region_name or AWS_BILLING_REGION)
+
+
+def sts_client(region_name: str | None = None):
+    return aws_client("sts", region_name=region_name)
+
+
+# PER-ENVIRONMENT: must match Prometheus Service DNS (namespace/name) in this cluster.
 PROMETHEUS_URL = os.getenv(
     "PROMETHEUS_URL",
     "http://prometheus.monitoring.svc.cluster.local:9090",

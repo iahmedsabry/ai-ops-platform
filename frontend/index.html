@@ -53,6 +53,12 @@
         font-feature-settings: "cv02", "cv11", "ss01";
       }
 
+      @property --loading-angle {
+        syntax: "<angle>";
+        inherits: false;
+        initial-value: 0deg;
+      }
+
       * { box-sizing: border-box; }
 
       html, body {
@@ -196,11 +202,17 @@
         border-radius: 999px;
       }
 
+      .sidebar-item-row {
+        position: relative;
+        display: block;
+        margin-bottom: 3px;
+        border-radius: 10px;
+      }
+
       .sidebar-item {
         display: block;
         width: 100%;
-        padding: 10px 12px;
-        margin-bottom: 3px;
+        padding: 10px 38px 10px 12px;
         border: none;
         border-radius: 10px;
         background: transparent;
@@ -226,6 +238,55 @@
           rgba(210, 120, 137, 0.12)
         );
         box-shadow: inset 0 0 0 1px rgba(155, 35, 129, 0.14);
+      }
+
+      .sidebar-item-trash {
+        position: absolute;
+        top: 50%;
+        right: 7px;
+        transform: translateY(-50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        min-width: 26px;
+        height: 26px;
+        border: none;
+        border-radius: 9px;
+        background: transparent;
+        color: rgba(95, 53, 95, 0.74);
+        opacity: 0;
+        pointer-events: none;
+        transition:
+          opacity 0.14s ease,
+          background 0.14s ease,
+          color 0.14s ease;
+      }
+
+      .sidebar-item-row:hover .sidebar-item-trash,
+      .sidebar-item-row:focus-within .sidebar-item-trash {
+        opacity: 1;
+        pointer-events: auto;
+      }
+
+      .sidebar-item-trash:hover {
+        background: rgba(155, 35, 129, 0.1);
+        color: var(--c-plum);
+      }
+
+      .sidebar-item-trash:focus {
+        opacity: 1;
+        pointer-events: auto;
+        outline: none;
+        background: rgba(155, 35, 129, 0.13);
+        color: var(--c-plum);
+        box-shadow: 0 0 0 2px rgba(155, 35, 129, 0.13);
+      }
+
+      .sidebar-item-trash svg {
+        width: 15px;
+        height: 15px;
+        stroke: currentColor;
       }
 
       .sidebar-item-title {
@@ -493,28 +554,6 @@
 
       .bubble.prose strong { font-weight: 650; color: var(--c-plum); }
 
-      .typing-dot {
-        display: inline-flex;
-        gap: 5px;
-        padding: 4px 0;
-      }
-
-      .typing-dot span {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: var(--c-pink);
-        animation: bounce 1.15s infinite ease-in-out;
-      }
-
-      .typing-dot span:nth-child(2) { animation-delay: 0.13s; }
-      .typing-dot span:nth-child(3) { animation-delay: 0.26s; }
-
-      @keyframes bounce {
-        0%, 80%, 100% { transform: scale(0.55); opacity: 0.42; }
-        40% { transform: scale(1); opacity: 0.9; }
-      }
-
       /* Composer & message field */
       .composer {
         flex-shrink: 0;
@@ -585,6 +624,45 @@
           0 0 0 1px rgba(155, 35, 129, 0.1),
           0 2px 6px rgba(50, 11, 50, 0.05),
           0 -1px 4px rgba(50, 11, 50, 0.04);
+      }
+
+      .input-shell.is-loading {
+        border-color: transparent;
+        box-shadow: 0 1px 2px rgba(50, 11, 50, 0.04);
+      }
+
+      .input-shell.is-loading::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        pointer-events: none;
+        padding: 1.5px;
+        --loading-angle: 0deg;
+        background:
+          conic-gradient(
+            from var(--loading-angle),
+            rgba(155, 35, 129, 0) 0deg,
+            rgba(155, 35, 129, 0) 334deg,
+            rgba(155, 35, 129, 0.24) 341deg,
+            rgba(155, 35, 129, 0.98) 349deg,
+            rgba(155, 35, 129, 0.24) 357deg,
+            rgba(155, 35, 129, 0) 360deg
+          );
+        -webkit-mask:
+          linear-gradient(#fff 0 0) content-box,
+          linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+        mask:
+          linear-gradient(#fff 0 0) content-box,
+          linear-gradient(#fff 0 0);
+        mask-composite: exclude;
+        animation: loadingTunnel 3.2s linear infinite;
+      }
+
+      @keyframes loadingTunnel {
+        from { --loading-angle: 0turn; }
+        to { --loading-angle: 1turn; }
       }
 
       /* Previews live above row so buttons stay bottom-pinned independently */
@@ -2236,6 +2314,34 @@
         return null;
       }
 
+      function deleteSessionById(id) {
+        var before = store.sessions.length;
+        store.sessions = store.sessions.filter(function (s) {
+          return s.id !== id;
+        });
+        if (store.sessions.length === before) return;
+
+        if (store.activeId === id) {
+          var nextActive = null;
+          var si;
+          for (si = 0; si < store.sessions.length; si++) {
+            if (store.sessions[si].messages && store.sessions[si].messages.length > 0) {
+              nextActive = store.sessions[si].id;
+              break;
+            }
+          }
+          store.activeId = nextActive;
+        }
+
+        if (!store.activeId) {
+          ensureDraftSession();
+        }
+
+        saveStore();
+        renderSidebarList();
+        renderThread();
+      }
+
       function updateModelUI() {
         var hostShort = "";
         if (apiBaseDisplay) {
@@ -2302,6 +2408,9 @@
 
         for (var j = 0; j < sessions.length; j++) {
           var sess = sessions[j];
+          var row = document.createElement("div");
+          row.className = "sidebar-item-row";
+
           var btn = document.createElement("button");
           btn.type = "button";
           btn.className =
@@ -2313,6 +2422,25 @@
           t.textContent = displayTitle;
 
           btn.appendChild(t);
+
+          var trash = document.createElement("button");
+          trash.type = "button";
+          trash.className = "sidebar-item-trash";
+          trash.setAttribute("aria-label", "Delete chat");
+          trash.title = "Delete chat";
+          trash.innerHTML =
+            '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4.8c0-.7.57-1.3 1.3-1.3h5.4c.73 0 1.3.6 1.3 1.3V6"/><path d="M18 6l-1 13.3c-.07.95-.86 1.7-1.82 1.7H8.82c-.96 0-1.75-.75-1.82-1.7L6 6"/><path d="M10 10.2v6.2M14 10.2v6.2"/></svg>';
+
+          trash.addEventListener(
+            "click",
+            function (id) {
+              return function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                deleteSessionById(id);
+              };
+            }(sess.id)
+          );
           btn.addEventListener(
             "click",
             function (id) {
@@ -2328,7 +2456,9 @@
             }(sess.id)
           );
 
-          sidebarList.appendChild(btn);
+          row.appendChild(btn);
+          row.appendChild(trash);
+          sidebarList.appendChild(row);
         }
       }
 
@@ -2403,29 +2533,7 @@
       }
 
       function showTypingBubble() {
-        hideEmptyIfNeeded();
-        var row = document.createElement("div");
-        row.className = "msg-msg assistant";
-        row.setAttribute("data-typing", "1");
-
-        var shell = document.createElement("div");
-        shell.className = "bubble-shell";
-
-        var bubble = document.createElement("div");
-        bubble.className = "bubble prose";
-        var wrap = document.createElement("span");
-        wrap.className = "typing-dot";
-        wrap.setAttribute("aria-label", "Generating");
-        for (var i = 0; i < 3; i++) {
-          wrap.appendChild(document.createElement("span"));
-        }
-        bubble.appendChild(wrap);
-
-        shell.appendChild(bubble);
-        row.appendChild(shell);
-        chatEl.appendChild(row);
-        scrollMessagesToEnd();
-        return row;
+        return null;
       }
 
       function removeTypingRow(row) {
@@ -2629,6 +2737,9 @@
         busy = true;
         sendBtn.disabled = true;
 
+        var shell = messageInput.closest(".input-shell");
+        if (shell) shell.classList.add("is-loading");
+
         var imagePromises = [];
         for (i = 0; i < selectedFiles.length; i++) {
           imagePromises.push(fileToImagePart(selectedFiles[i]));
@@ -2712,6 +2823,7 @@
         } finally {
           busy = false;
           sendBtn.disabled = false;
+          if (shell) shell.classList.remove("is-loading");
           messageInput.focus();
         }
       }
