@@ -1,4 +1,4 @@
-"""Orchestrates planner (Gemini), sandbox tools, and final analysis (Gemini)."""
+"""Orchestrates planner, sandbox tools, and final analysis using an LLM."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any, Optional
 from shared.tool_catalog import allowed_tool_names, load_tool_entries
 
 from agent_controller.config import Settings
-from agent_controller.gemini_client import GeminiClient, extract_text
+from agent_controller.llm_client import LLMClient, extract_text
 from agent_controller.images import sanitize_chat_images
 from agent_controller.models import ChatRequest
 from agent_controller.planner import (
@@ -33,18 +33,20 @@ class ChatOrchestrator:
     def __init__(
         self,
         settings: Optional[Settings] = None,
-        gemini: Optional[GeminiClient] = None,
+        llm: Optional[LLMClient] = None,
         sandbox: Optional[SandboxClient] = None,
     ):
         self.settings = settings or Settings()
-        self.gemini = gemini or GeminiClient(self.settings)
+        self.llm = llm or LLMClient(self.settings)
         self.sandbox = sandbox or SandboxClient(self.settings)
 
     def chat_metadata(self) -> dict[str, Any]:
         return {
             "status": "ok",
-            "model": self.settings.gemini_model,
-            "api_base_display": self.settings.gemini_display_api,
+            "provider": self.settings.llm_provider,
+            "api_style": self.settings.llm_api_style,
+            "model": self.settings.llm_model,
+            "api_base_display": self.settings.llm_display_api,
             "supports_post": True,
             "supports_images": True,
             "max_chat_images": self.settings.max_chat_images,
@@ -100,13 +102,16 @@ USER SELECTED FOCUS (bias tool choice and analysis toward this)
             .replace("<<<USER_MESSAGE>>>", request.message or "")
         )
         tool_prompt = visual_planner_intro + planner_body
-        tool_decision = self.gemini.generate(tool_prompt, inline_visuals)
+        tool_decision = self.llm.generate(tool_prompt, inline_visuals)
         if tool_decision.get("error"):
             return {
                 "error": tool_decision.get("error"),
                 "details": tool_decision.get("raw_response", ""),
             }
-        decision_text = extract_text(tool_decision)
+        decision_text = extract_text(
+            tool_decision,
+            self.settings.llm_api_style,
+        )
         print("Tool decision:")
         print(decision_text)
         try:
@@ -141,7 +146,7 @@ USER SELECTED FOCUS (bias tool choice and analysis toward this)
                     prompt_focus_separator.rstrip(),
                 ).replace("<<<USER_MESSAGE>>>", request.message or "")
             )
-            response = self.gemini.generate(normal_prompt, inline_visuals)
+            response = self.llm.generate(normal_prompt, inline_visuals)
             if response.get("error"):
                 return {
                     "error": response.get("error"),
@@ -149,7 +154,10 @@ USER SELECTED FOCUS (bias tool choice and analysis toward this)
                 }
             return {
                 "mode": "conversation",
-                "response": extract_text(response),
+                "response": extract_text(
+                    response,
+                    self.settings.llm_api_style,
+                ),
             }
         tool_results: list[dict[str, Any]] = []
         tool_calls = decision_json.get("tool_calls", [])
@@ -216,7 +224,7 @@ USER SELECTED FOCUS (bias tool choice and analysis toward this)
             .replace("<<<INVESTIGATION_PAYLOAD>>>", investigation_payload)
         )
         analysis_prompt = analysis_visual_intro + analysis_body
-        analysis_response = self.gemini.generate(
+        analysis_response = self.llm.generate(
             analysis_prompt,
             inline_visuals,
         )
@@ -226,7 +234,10 @@ USER SELECTED FOCUS (bias tool choice and analysis toward this)
                 "details": analysis_response.get("raw_response", ""),
                 "summary": summary,
             }
-        final_response = extract_text(analysis_response)
+        final_response = extract_text(
+            analysis_response,
+            self.settings.llm_api_style,
+        )
         return {
             "mode": "tool_analysis",
             "summary": summary,

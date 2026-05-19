@@ -1,4 +1,4 @@
-"""Validate and normalize chat images before sending to Gemini."""
+"""Validate and normalize chat images before sending to an LLM."""
 
 from __future__ import annotations
 
@@ -66,3 +66,20 @@ def build_gemini_parts_from_inline(
             }
         )
     return parts
+
+
+def build_openai_content_from_inline(
+    prompt: str,
+    inline_items: list[dict],
+) -> list[dict]:
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for item in inline_items:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{item['mime_type']};base64,{item['data']}"
+                },
+            }
+        )
+    return content
