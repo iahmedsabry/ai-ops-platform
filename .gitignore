@@ -3,6 +3,7 @@
 *.tfstate
 *.tfstate.*
 crash.log
+*plan*
 
 # Environment variables (sensitive data)
 .env

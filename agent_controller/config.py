@@ -8,7 +8,7 @@ see `ENVIRONMENT_VALUES.md` at the workspace root.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from agent_controller import variables
 
@@ -56,9 +56,11 @@ class Settings:
     llm_max_retries: int = _to_int(
         "LLM_MAX_RETRIES", variables.LLM_MAX_RETRIES
     )
-    llm_retryable_status_codes: list[int] = _to_status_code_list(
-        "LLM_RETRYABLE_STATUS_CODES",
-        variables.LLM_RETRYABLE_STATUS_CODES,
+    llm_retryable_status_codes: list[int] = field(
+        default_factory=lambda: _to_status_code_list(
+            "LLM_RETRYABLE_STATUS_CODES",
+            variables.LLM_RETRYABLE_STATUS_CODES,
+        )
     )
     llm_auth_header: str = os.getenv(
         "LLM_AUTH_HEADER", variables.LLM_AUTH_HEADER

@@ -5,13 +5,13 @@ Environment variables with matching names can still override these defaults.
 """
 
 # LLM provider configuration
-LLM_PROVIDER = "gemini"
-LLM_API_STYLE = "gemini"
+LLM_PROVIDER = "github_models"
+LLM_API_STYLE = "openai_chat"
 LLM_API_KEY = ""
-LLM_MODEL = "gemini-2.5-flash"
-LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+LLM_MODEL = "openai/gpt-5-mini"
+LLM_BASE_URL = "https://models.github.ai/inference"
 LLM_ENDPOINT_PATH = ""
-LLM_DISPLAY_API = "https://generativelanguage.googleapis.com/v1beta"
+LLM_DISPLAY_API = "https://models.github.ai/inference"
 LLM_TIMEOUT = "90"
 LLM_MAX_RETRIES = "3"
 LLM_RETRYABLE_STATUS_CODES = "429,500,502,503,504"

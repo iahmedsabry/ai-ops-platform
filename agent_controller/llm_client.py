@@ -87,6 +87,11 @@ class LLMClient:
         inlined = inline_images if inline_images is not None else []
         style = (self._settings.llm_api_style or "").strip().lower()
         max_retries = max(self._settings.llm_max_retries, 1)
+        started_at = time.time()
+        last_status_code: Optional[int] = None
+        last_response_body = ""
+        last_exception = ""
+        last_error_type = "unknown"
         for attempt in range(max_retries):
             try:
                 request_args = self._build_request(style, prompt, inlined)
@@ -97,6 +102,8 @@ class LLMClient:
                     json=request_args["body"],
                     timeout=self._settings.llm_timeout,
                 )
+                last_status_code = response.status_code
+                last_response_body = response.text
                 print("LLM status code:", response.status_code)
                 print("LLM raw response:")
                 print(response.text)
@@ -104,8 +111,15 @@ class LLMClient:
                     try:
                         return response.json()
                     except Exception as json_error:
+                        elapsed_ms = int((time.time() - started_at) * 1000)
                         return {
                             "error": "Failed to parse LLM JSON",
+                            "error_type": "json_parse_error",
+                            "attempts": attempt + 1,
+                            "elapsed_ms": elapsed_ms,
+                            "provider": self._settings.llm_provider,
+                            "api_style": self._settings.llm_api_style,
+                            "model": self._settings.llm_model,
                             "raw_response": response.text,
                             "exception": str(json_error),
                         }
@@ -113,20 +127,54 @@ class LLMClient:
                     response.status_code
                     in self._settings.llm_retryable_status_codes
                 ):
+                    last_error_type = "retryable_http_error"
                     print(
                         "Retryable LLM error:",
                         response.status_code,
                     )
                     time.sleep(2**attempt)
                     continue
+                elapsed_ms = int((time.time() - started_at) * 1000)
+                last_error_type = "http_error"
                 return {
                     "error": f"LLM API returned {response.status_code}",
+                    "error_type": last_error_type,
+                    "attempts": attempt + 1,
+                    "elapsed_ms": elapsed_ms,
+                    "provider": self._settings.llm_provider,
+                    "api_style": self._settings.llm_api_style,
+                    "model": self._settings.llm_model,
+                    "last_status_code": response.status_code,
                     "raw_response": response.text,
                 }
-            except Exception as request_error:
-                print("LLM request failed:", str(request_error))
+            except requests.Timeout as request_error:
+                last_error_type = "timeout"
+                last_exception = str(request_error)
+                print("LLM request timed out:", last_exception)
                 time.sleep(2**attempt)
-        return {"error": "LLM API failed after retries"}
+            except requests.RequestException as request_error:
+                last_error_type = "request_exception"
+                last_exception = str(request_error)
+                print("LLM request failed:", last_exception)
+                time.sleep(2**attempt)
+            except Exception as request_error:
+                last_error_type = "unexpected_exception"
+                last_exception = str(request_error)
+                print("LLM request failed:", last_exception)
+                time.sleep(2**attempt)
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        return {
+            "error": "LLM API failed after retries",
+            "error_type": last_error_type,
+            "attempts": max_retries,
+            "elapsed_ms": elapsed_ms,
+            "provider": self._settings.llm_provider,
+            "api_style": self._settings.llm_api_style,
+            "model": self._settings.llm_model,
+            "last_status_code": last_status_code,
+            "last_exception": last_exception,
+            "raw_response": last_response_body,
+        }
 
     def _build_request(
         self,
